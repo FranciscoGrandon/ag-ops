@@ -31,10 +31,10 @@ flowchart TD
         CLI --> Mine["5. regret-mine (Minería AST sobre Git)"]
     end
 
-    subgraph Storage["Almacenamiento Local & Artefactos (.ag_state/)"]
+    subgraph Storage["Almacenamiento Local & Artefactos (.ag_state/ & ./logs/)"]
         Guard <-->|Recibo v2| Receipts[".ag_state/merkle_guard_<hash[:12]>.json"]
         State <-->|Fases y Hashes| StateFiles[".ag_state/NN_<slug>.json"]
-        Distill -->|Log Crudo| RawLog[".ag_state/distill_raw.log"]
+        Distill -->|Log Crudo| RawLog["./logs/raw_<timestamp>.log"]
     end
 
     subgraph OS["Sistema Operativo & Repositorio"]
@@ -80,10 +80,10 @@ python ag_ops.py guard verify-green --test-dir tests/ --json
 Ejecuta comandos de compilación o pruebas en subprocesos con aislamiento de grupo (`os.setsid` / `CREATE_NEW_PROCESS_GROUP`), guardando el registro completo en disco y entregando al agente únicamente el delta crítico estructurado.
 
 * **Anclaje de Regex Estricto:** Expresiones regulares ancladas al inicio de línea (`^\s*E\s{3}`, `AssertionError`, trazas y diagnósticos de compilador), neutralizando falsos positivos ante salidas como `"DONE   all good"`.
-* **Salida JSON:** Devuelve `exit_code`, `critical_delta`, `raw_log_path` y `duration_ms`.
+* **Salida JSON:** Devuelve `exit_code`, `critical_delta` (o `tail` en éxito), `raw_log` y `duration_ms`.
 
 ```powershell
-python ag_ops.py distill --cmd "pytest -v" --timeout-sec 30 --json
+python ag_ops.py distill --cmd "pytest -v" --timeout 30 --json
 ```
 
 ### 2.3 `state` — Runlevels Lexicográficos y Detección de Deriva
@@ -96,10 +96,10 @@ Implementa persistencia de fases en disco (`.ag_state/NN_<slug>.json`) inspirada
 
 ```powershell
 # Escribir fase
-python ag_ops.py state write --step 1 --name "analisis" --status COMPLETADO --artifacts "docs/reporte.md" --replace --json
+python ag_ops.py state write --dir .ag_state --step 1 --name "analisis" --status COMPLETADO --artifacts "docs/reporte.md" --replace --json
 
 # Verificar deriva
-python ag_ops.py state status --strict --json
+python ag_ops.py state status --dir .ag_state --strict --json
 ```
 
 ### 2.4 `ast-lint` — Linter Estático AST (< 40 ms) y Validación Graphviz DOT
@@ -122,8 +122,8 @@ python ag_ops.py ast-lint . --author "Francisco Grandón Vergara" --include-dot 
 Audita el historial reciente del repositorio Git (`--window-min`, por defecto 60 minutos) identificando funciones en el árbol AST modificadas repetidamente en commits consecutivos.
 
 * **4 Puertas de Asimetría Deterministas:** Separa el TDD saludable (`Green -> Refactor`) de regresiones reales de código:
-  1. `FIX_VERB_INTENT`: Presencia de verbos correctivos (`fix:`, `patch:`, `repair:`).
-  2. `TEST_ASSERTION_DELTA`: Disminución o salto anómalo en el conteo de aserciones de prueba.
+  1. `FIX_VERB_INTENT`: Presencia de verbos correctivos reales evaluados por `_FIX_VERB_RE` (`fix`, `bug`, `hotfix`, `revert`, `patch`, `typo`, entre otros).
+  2. `TEST_ASSERTION_DELTA`: Modificación simultánea de archivos de prueba junto con la función de producción en el commit posterior (`len(newer["test_files"]) > 0`, diferenciándolo de un refactor puro que solo toca producción).
   3. `LINE_REVERSAL_OVERLAP`: Inversión de líneas agregadas/borradas con guardas protectoras de refactorización limpia.
   4. `GUARD_COLLISION_RECEIPT`: Correlación con colisiones registradas en `.ag_state/`.
 

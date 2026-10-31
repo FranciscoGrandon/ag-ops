@@ -5,6 +5,11 @@ El formato se basa en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/
 
 Creado por Francisco Grandón Vergara
 
+## [Unreleased]
+
+### Corregido
+- **Documentación (`README.md`)**: Alineación exacta de ejemplos CLI, flags `argparse` y claves JSON frente al contrato real de `ag_ops.py` v2.1.0 (`--timeout`, clave `raw_log` y ruta por defecto `./logs/raw_<timestamp>.log` en `distill`; argumento obligatorio `--dir .ag_state` en `state`; verbos reales de `_FIX_VERB_RE` en `FIX_VERB_INTENT` y criterio de Etapa 1 `len(newer["test_files"]) > 0` en `TEST_ASSERTION_DELTA` para `regret-mine`).
+
 ## [2.1.0] - 2026-10-31
 
 ### Añadido
