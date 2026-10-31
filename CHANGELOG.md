@@ -1,15 +1,17 @@
-﻿# Changelog
+# Changelog
 
 Todos los cambios notables de `ag_ops.py` se documentan aquí.
 Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/).
 
 Creado por Francisco Grandón Vergara
 
-## [Unreleased]
+## [2.1.0] - 2026-10-31
 
 ### Añadido
-- Suite de pruebas `test_ag_ops_v2_1.py` (6 bloques: guard, distill, state, ast-lint, regret-mine) y `test_ag_ops_v2.py`.
-- Informe `INFORME_PRUEBAS_ag_ops_v2.md` con resultados, defectos y latencia.
+- Publicación formal del repositorio público de código abierto en GitHub: [`FranciscoGrandon/ag-ops`](https://github.com/FranciscoGrandon/ag-ops).
+- Lanzamiento del release oficial [`v2.1.0`](https://github.com/FranciscoGrandon/ag-ops/releases/tag/v2.1.0) con notas de cambios estructuradas y licencia MIT.
+- Suite de pruebas de regresión e integración pública `tests/test_ag_ops.py` (6/6 bloques aprobados al 100%).
+- Aislamiento estricto de artefactos internos en el repositorio público, manteniendo en local las notas de desarrollo y publicando exclusivamente el código fuente ejecutable (`ag_ops.py`), las pruebas y la documentación técnica oficial (`README.md`, `LICENSE`, `CHANGELOG.md`).
 
 ## [2.1] - 2026-10-30
 

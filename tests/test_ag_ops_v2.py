@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Creado por Francisco Grandón Vergara
+# Licensed under the MIT License
 """Suite de verificación integral (6/6 bloques) para ag_ops_v2.py."""
 
 import json
