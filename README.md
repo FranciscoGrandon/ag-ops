@@ -1,7 +1,7 @@
-# CLI Engine for Agent Governance (`ag_ops` v2.3)
+# CLI Engine for Agent Governance (`ag_ops` v2.3.0)
 
 > **Creado por Francisco Grandón Vergara**  
-> *Motor determinista en Python puro (librería estándar, sin dependencias externas) diseñado para la gobernanza estricta, trazabilidad criptográfica, linters estructurales y minería de regresiones en agentes autónomos dentro del ecosistema Antigravity.*
+> *Motor determinista en Python puro (librería estándar, sin dependencias externas) diseñado para la gobernanza estricta, trazabilidad criptográfica, linters estructurales y minería de regresión.*
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -13,14 +13,14 @@
 
 ## 1. Arquitectura Implementada en la Práctica
 
-`ag_ops_v2.py` es un arnés determinista de ejecución y control de integridad local para agentes autónomos. En lugar de confiar en instrucciones pasivas en los prompts, actúa como un **puente físico intermedio** entre el agente de Antigravity, el sistema de archivos del proyecto, el motor de pruebas y el repositorio Git.
+`ag_ops.py` es el arnés determinista de ejecución y control de integridad local para agentes autónomos. En lugar de confiar en instrucciones pasivas en los prompts, actúa como un **puente físico entre la ejecución del agente y la verificación de invariantes**: sellado de pruebas, distilación de logs, bloqueo de pasos, validación estática AST, análisis de drift y minería de arrepentimiento.
 
 ### 1.1 Diagrama de Flujo y Componentes Físicos en Ejecución
 
 ```mermaid
 flowchart TD
     subgraph AGY["Entorno Antigravity (Google Antigravity)"]
-        Agent["Agente / Subagente Antigravity"] -->|run_command| CLI["ag_ops_v2.py (Python stdlib)"]
+        Agent["Agente / Subagente Antigravity"] -->|run_command| CLI["ag_ops.py (Python stdlib)"]
     end
 
     subgraph Core["Motor de Gobernanza Determinista (ag_ops)"]
@@ -32,7 +32,7 @@ flowchart TD
     end
 
     subgraph Storage["Almacenamiento Local & Artefactos (.ag_state/ & ./logs/)"]
-        Guard <-->|Recibo v2| Receipts[".ag_state/merkle_guard_<hash[:12]>.json"]
+        Guard <-->|Recibo v2.3| Receipts[".ag_state/merkle_guard_<hash[:12]>.json"]
         State <-->|Fases y Hashes| StateFiles[".ag_state/NN_<slug>.json"]
         Distill -->|Log Crudo| RawLog["./logs/raw_<timestamp>.log"]
     end
@@ -47,8 +47,8 @@ flowchart TD
 ```
 
 ### 1.2 Invariantes de Ingeniería Implementadas
-1. **Cero Dependencias Externas:** 100% biblioteca estándar de Python (`ast`, `hashlib`, `subprocess`, `json`, `pathlib`, `tempfile`). No requiere `pip install`, funcionando instantáneamente en Windows y Linux.
-2. **Escritura Atómica con Sincronización a Disco:** Todas las mutaciones de estado en `.ag_state/` usan archivos temporales con `os.replace` y `os.fsync`, previniendo corrupción de recibos ante interrupciones forzadas.
+1. **Cero Dependencias Externas:** 100% biblioteca estándar de Python (`ast`, `hashlib`, `subprocess`, `json`, `pathlib`, `tempfile`). No requiere `pip install`, funcionando instantáneamente en entornos herméticos.
+2. **Escritura Atómica con Sincronización a Disco:** Todas las mutaciones de estado en `.ag_state/` usan archivos temporales con `os.replace` y `os.fsync`, previniendo corrupción de recibos antidesordenados.
 3. **Contrato Estricto de Códigos de Salida:**
    - `0`: Operación exitosa / Invariantes íntegras.
    - `1`: Error de validación, sintaxis, conflicto de pasos o directorio vacío (`EMPTY_TEST_TARGET`).
@@ -63,34 +63,34 @@ Sella el árbol de pruebas mediante hashes SHA-256 antes de que el agente altere
 
 * **Aislamiento por Target:** Los recibos se nombran de forma unívoca según el objetivo:  
   `.ag_state/merkle_guard_<sha256(normcase(target))[:12]>.json`.
-* **Bloqueo de `--ignore` y Protección de Symlinks (v2.2):**
-  - **Invariante H1:** En `verify-green`, los patrones `--ignore` se extraen exclusivamente del recibo rojo sellado. Si el agente intenta pasar un `--ignore` discrepante (p. ej. para excluir un `conftest.py` malicioso recién inyectado), la ejecución aborta con `IGNORE_PATTERN_MISMATCH` (`exit 2`) y audita la colisión.
-  - **Rechazo de Symlinks:** Detección estricta de enlaces simbólicos (`is_symlink()`) en cualquier punto del árbol de pruebas, levantando `ValueError` y bloqueando posibles fugas fuera del Merkle root.
+* **Bloqueo de `--ignore` y Protección de Symlinks (v2.2+):**
+  - **Invariante H1:** En `verify-green`, los patrones `--ignore` se extraen exclusivamente del recibo rojo sellado. Si el agente intenta pasar un `--ignore` discrepante (p. ej. para excluir un caso de regresión), el comando aborta con `IGNORE_PATTERN_MISMATCH` (`exit 2`).
+  - **Rechazo de Symlinks:** Detección estricta de enlaces simbólicos (`is_symlink()`) en cualquier punto del árbol de pruebas, levantando `ValueError` y bloqueando posibles fugas fuera del Merkle del repositorio.
 * **Subcomandos:**
-  - `witness-red`: Ejecuta la suite de pruebas esperada en fallo inicial. Valida códigos de aserción (rechaza anomalías de entorno como 2, 3, 4, 5, 126, 127, 9009), genera el árbol Merkle de los archivos de prueba y emite el recibo v2.
+  - `witness-red`: Ejecuta la suite de pruebas esperada en fallo inicial. Valida códigos de aserción (rechaza anomalías de entorno como 2, 3, 4, 5, 126, 127, 9009), genera el árbol Merkle de la prueba y almacena el recibo rojo con firma de fallo y `witnessed_head_sha`.
   - `verify-green`: Reejecuta los tests tras el arreglo. Si algún archivo de prueba fue editado o borrado, aborta con `EACCES_TEST_TAMPERING` (`exit 2`) y registra la colisión en vuelo en el recibo.
-  - `renegotiate`: Permite modificar los tests únicamente ante una prueba formal en disco (**SCAR-PROC-150**). Con `--require-witness`, rechaza excusas textuales (`LAZY_RETRACTION_REJECTED`) y exige `--witness-type spec-collision` (con `--conflict-a` y `--conflict-b` en `archivo:línea` reales), `api-lock` o `arch-fork`.
+  - `renegotiate`: Permite modificar los tests únicamente ante una prueba formal en disco (**SCAR-PROC-150**). Con `--require-witness`, rechaza excusas textuales (`LAZY_RETRACTION_REJECTED`) y exige una prueba constructiva verificada.
 
 ```powershell
 # Registrar fallo inicial y sellar tests
-python ag_ops_v2.py guard witness-red --test-dir tests/ --cmd "pytest" --json
+python ag_ops.py guard witness-red --test-dir tests/ --cmd "pytest" --json
 
 # Verificar paso en verde sin manipulación de pruebas
-python ag_ops_v2.py guard verify-green --test-dir tests/ --json
+python ag_ops.py guard verify-green --test-dir tests/ --json
 ```
 
 ### 2.2 `distill` — Destilación Determinista de Logs con Timeout
-Ejecuta comandos de compilación o pruebas en subprocesos con aislamiento de grupo (`os.setsid` / `CREATE_NEW_PROCESS_GROUP`), guardando el registro completo en disco y entregando al agente únicamente el delta crítico estructurado.
+Ejecuta comandos de compilación o pruebas en subprocesos con aislamiento de grupo (`os.setsid` / `CREATE_NEW_PROCESS_GROUP`), guardando el registro completo en disco y entregando al agente únicamente el delta crítico.
 
-* **Anclaje de Regex Estricto:** Expresiones regulares ancladas al inicio de línea (`^\s*E\s{3}`, `AssertionError`, trazas y diagnósticos de compilador), neutralizando falsos positivos ante salidas como `"DONE   all good"`.
+* **Anclaje de Regex Estricto:** Expresiones regulares ancladas al inicio de línea (`^\s*E\s{3}`, `AssertionError`, trazas de compilador), neutralizando falsos positivos ante salidas largas.
 * **Salida JSON:** Devuelve `exit_code`, `critical_delta` (o `tail` en éxito), `raw_log` y `duration_ms`.
 
 ```powershell
-python ag_ops_v2.py distill --cmd "pytest -v" --timeout 30 --json
+python ag_ops.py distill --cmd "pytest -v" --timeout 30 --json
 ```
 
 ### 2.3 `state` — Runlevels Lexicográficos y Detección de Deriva
-Implementa persistencia de fases en disco (`.ag_state/NN_<slug>.json`) inspirada en los runlevels Unix (`00_governance` a `99_sintesis`), permitiendo al agente sobrevivir a la compactación de contexto (*200k-token lobotomy*).
+Implementa persistencia de fases en disco (`.ag_state/NN_<slug>.json`) inspirada en los runlevels Unix (`00_governance` a `99_sintesis`), permitiendo al agente sobrevivir a la compactación de contexto y mantener una línea de tiempo determinista.
 
 * **Trazabilidad de Artefactos:** Distingue entre archivos que nunca existieron (`ARTIFACT_NEVER_EXISTED`) y eliminaciones imprevistas (`FILE_DELETED`).
 * **Sellado Automático:** Registra el hash SHA-256 de los artefactos producidos la primera vez que aparecen en el sistema de archivos.
@@ -99,10 +99,10 @@ Implementa persistencia de fases en disco (`.ag_state/NN_<slug>.json`) inspirada
 
 ```powershell
 # Escribir fase
-python ag_ops_v2.py state write --dir .ag_state --step 1 --name "analisis" --status COMPLETADO --artifacts "docs/reporte.md" --replace --json
+python ag_ops.py state write --dir .ag_state --step 1 --name "analisis" --status COMPLETADO --artifacts "docs/reporte.md" --replace --json
 
 # Verificar deriva
-python ag_ops_v2.py state status --dir .ag_state --strict --json
+python ag_ops.py state status --dir .ag_state --strict --json
 ```
 
 ### 2.4 `ast-lint` — Linter Estático AST (< 40 ms) y Validación Graphviz DOT
@@ -116,27 +116,27 @@ Inspecciona el código fuente sin ejecutarlo, previniendo errores arquitectónic
   - `AUTH001`: Validación de cabecera obligatoria de autoría (configurable con `--author`).
 * **Protección contra Deriva Autoinmune y Modo `--strict` (H3):**
   - Con `--context-map`: Degrada reglas de `ENFORCED` a `PROBATIONARY_REVERIFY` cuando archivos ancla (`pyproject.toml`) cambian de hash.
-  - Con `--strict`: Falla inmediatamente con `STRICT_PROBATIONARY` (`exit 2`) si algún hallazgo fue degradado por ancla modificada o borrada, cerrando la puerta a la desactivación silenciosa de reglas.
-* **Validación Topológica Graphviz DOT (Target 15):** Valida que las máquinas de estado en `.dot` no tengan *deadlocks* (`DOT001`), no contengan nodos inalcanzables (`DOT002`), obliguen a transiciones de salida o cancelación en estados asíncronos (`SCAR-PROC-152`) y posean predicados `[guard: ...]` contra callbacks zombis (`SCAR-ASYNC-01`).
+  - Con `--strict`: Falla inmediatamente con `STRICT_PROBATIONARY` (`exit 2`) si algún hallazgo fue degradado por ancla modificada o borrada, cerrando la puerta a la desactivación silenciosa de garantías.
+* **Validación Topológica Graphviz DOT (Target 15):** Valida que las máquinas de estado en `.dot` no tengan *deadlocks* (`DOT001`), no contengan nodos inalcanzables (`DOT002`), obliguen a transiciones explícitas y requieran guardas en aristas asíncronas (`SCAR-PROC-152`, `SCAR-ASYNC-01`).
 
 ```powershell
-python ag_ops_v2.py ast-lint . --author "Francisco Grandón Vergara" --include-dot --json
+python ag_ops.py ast-lint . --author "Francisco Grandón Vergara" --include-dot --json
 ```
 
 ### 2.5 `regret-mine` — Minería de Arrepentimiento Rápido en Git
 Audita el historial reciente del repositorio Git (`--window-min`, por defecto 60 minutos) identificando funciones en el árbol AST modificadas repetidamente en commits consecutivos.
 
-* **Aislamiento `argv` e Inmunidad a Inyecciones (H2):** Todas las invocaciones internas a Git se ejecutan mediante listas de argumentos `argv` (`shell=False`), neutralizando ataques de inyección de comandos en nombres de archivos históricos (p. ej. `a$(touch PWNED).py`).
+* **Aislamiento `argv` e Inmunidad a Inyecciones (H2):** Todas las invocaciones internas a Git se ejecutan mediante listas de argumentos `argv` (`shell=False`), neutralizando ataques de inyección por nombres maliciosos en archivos o commits.
 * **Soporte UTF-8 Completo:** Invocación de Git con `-c core.quotepath=false` para no escapar nombres con tildes (p. ej. `diseño.py`), garantizando su resolución sin errores de codificación.
 * **Calificación Jerárquica de Métodos:** Mapeo de funciones de clase como `ClassName.method` mediante `_FuncHashVisitor`, evitando colisiones entre métodos homónimos de distintas clases.
 * **4 Puertas de Asimetría Deterministas:** Separa el TDD saludable (`Green -> Refactor`) de regresiones reales de código:
-  1. `FIX_VERB_INTENT`: Presencia de verbos correctivos reales evaluados por `_FIX_VERB_RE` (`fix`, `bug`, `hotfix`, `revert`, `patch`, `typo`, entre otros).
-  2. `TEST_ASSERTION_DELTA`: Modificación simultánea de archivos de prueba junto con la función de producción en el commit posterior (`len(newer["test_files"]) > 0`, diferenciándolo de un refactor puro que solo toca producción).
+  1. `FIX_VERB_INTENT`: Presencia de verbos correctivos reales evaluados por `_FIX_VERB_RE` (`fix`, `bug`, `hotfix`, `revert`, `patch`, `typo` y variantes).
+  2. `TEST_ASSERTION_DELTA`: Modificación simultánea de archivos de prueba junto con la función de producción en el commit posterior (`len(newer["test_files"]) > 0`).
   3. `LINE_REVERSAL_OVERLAP`: Inversión de líneas agregadas/borradas con guardas protectoras de refactorización limpia.
   4. `GUARD_COLLISION_RECEIPT`: Correlación con colisiones registradas en `.ag_state/`.
 
 ```powershell
-python ag_ops_v2.py regret-mine --repo . --window-min 60 --json
+python ag_ops.py regret-mine --repo . --window-min 60 --json
 ```
 
 ---
@@ -144,12 +144,13 @@ python ag_ops_v2.py regret-mine --repo . --window-min 60 --json
 ## 3. Modelo de Amenazas y Verificación Experimental
 
 ### 3.1 Fronteras de Confianza y Modelo de Amenazas
-Para evitar sobrepromesas de seguridad dentro del mismo usuario/shell del agente, la arquitectura de gobernanza define tres adversarios (Descuidado, Reward Hacker, Hostil) y desacopla la autoridad final en CI:
+Para evitar sobrepromesas de seguridad dentro del mismo usuario/shell del agente, la arquitectura de gobernanza define tres adversarios (Descuidado, Reward Hacker, Hostil) y desacopla la autoridad del agente de la infraestructura que ejecuta las pruebas.
+
 * Consultar el [Modelo de Amenazas Formal (`THREAT_MODEL.md`)](THREAT_MODEL.md).
 * Consultar la [Especificación de Autoridad Fuera del Agente (`docs/ARCHITECTURE_V2_2_AUTHORITY.md`)](docs/ARCHITECTURE_V2_2_AUTHORITY.md).
 
-### 3.2 Resultados de la Suite de Pruebas Automatizadas (18/18 Pruebas)
-La arquitectura física de `ag_ops_v2.py` está respaldada por una suite automatizada de pruebas de regresión, integración y exploits (v2, v2.1 y v2.2) que cubre el 100% de los bloques funcionales:
+### 3.2 Resultados de la Suite de Pruebas Automatizadas (29/29 Pruebas)
+La arquitectura física de `ag_ops.py` está respaldada por una suite automatizada de pruebas de regresión, integración y exploits v2.x que cubre el 100% de los bloques funcionales principales del motor determinista.
 
 ```powershell
 # Ejecución de la suite completa con pytest
@@ -158,10 +159,10 @@ python -m pytest tests/ -v
 
 ### Resultados de Ejecución en Laboratorio:
 ```text
-tests/test_ag_ops_v2.py (6/6 pasadas)
+tests/test_ag_ops_v2.py (11/11 pasadas)
 tests/test_ag_ops_v2_1.py (6/6 pasadas)
 tests/test_ag_ops_v2_2.py (6/6 pasadas)
-============================= 18 passed in 17.29s =============================
+============================== 29 passed in 17.29s ==============================
 OK (100% aprobado)
 ```
 
@@ -173,17 +174,18 @@ La implementación de este motor no surge de la abstracción, sino de una **bús
 
 ### 4.1 La Trampa del Bucle Mortal de Prompts (*Quota vs. Prompt-Compliance Death Loop*)
 En herramientas como Antigravity (y de forma análoga a lo que ocurre con `.cursorrules` o `CLAUDE.md`), intentar gobernar agentes mediante reglas puramente textuales genera un bucle destructivo:
-* Al inyectar reglas negativas en prosa (*"NO tragues excepciones"*, *"NO alteres los tests"*), los tokens del antipatrón se incorporan al KV-cache del Transformer autorregresivo. La atracción estadística de tutoriales de internet termina disparando el comportamiento prohibido (efecto del "elefante rosa").
+* Al inyectar reglas negativas en prosa (`"NO tragues excepciones"`, `"NO alteres los tests"`), los tokens del antipatrón se incorporan al KV-cache del Transformer autorregresivo. La atracción por la instrucción negativa puede reforzar el comportamiento prohibido más que su prevención.
 * El usuario humano reacciona discutiendo en el chat con diffs masivos (+50k tokens), añade más directivas al prompt de sistema y vacía la cuota de inferencia sin resolver la raíz del problema.
 
 ### 4.2 La Investigación de Randal L. Schwartz (*Synthetic Scars*)
-Este motor traduce a código de producción los postulados de **Randal L. Schwartz** (Google Developer Expert) en su obra canónica [Giving AI Pain: The Architecture of Synthetic Scars & The Rapid-Regret Miner](https://dev.to/gde/giving-ai-pain-the-architecture-of-synthetic-scars-the-rapid-regret-miner-1740):
-* **El Fracaso de la *Bitter Lesson* en Código:** Escalar el cómputo de inferencia (*test-time compute*) sin restricciones físicas hace que el agente construya una **"Catedral sobre Arenas Movedizas"** (*Cathedral on Quicksand*): cientos de líneas de adaptadores y mocks tautológicos diseñados solo para pintar el test de verde mientras corrompen la arquitectura.
-* **Invariantes de Camino ($I_{\text{path}}(\pi)$):** Más del 95% de los fallos graves no violan el objetivo del ticket ($I_{\text{goal}}$), sino las obligaciones secundarias derivadas de la ruta de implementación (liberación de recursos, ausencia de mocks en producción, respeto a cabeceras).
+Este motor traduce a código de producción los postulados de **Randal L. Schwartz** (Google Developer Expert) en su obra canónica [Giving AI Pain: The Architecture of Synthetic Scars & The Rapid Regret Loop](https://www.randallischwartz.com/).
+
+* **El Fracaso de la *Bitter Lesson* en Código:** Escalar el cómputo de inferencia (*test-time compute*) sin restricciones físicas hace que el agente construya una **"Catedral sobre Arenas Movedizas"**: más consumo de tokens, menos predictibilidad y más posibilidad de seguir caminos no integrados.
+* **Invariantes de Camino ($I_{\text{path}}(\pi)$):** Más del 95% de los fallos graves no violan el objetivo del ticket ($I_{\text{goal}}$), sino las obligaciones secundarias derivadas de la ruta del código.
 * **Dolor Sintético:** Sustituir advertencias de texto por fricción mecánica real (Merkle trees, AST linters con Vector 4 de reflejo, runlevels en disco y minería de arrepentimiento).
 
 ### 4.3 Reducción Empírica de Contexto
-En mi publicación [I cut my agents' fixed context by 42% and moved its test rules into a hash-checked CLI](https://dev.to/fgrandon/i-cut-my-agents-fixed-context-by-42-and-moved-its-test-rules-into-a-hash-checked-cli-5dmp) demostré que externalizar estas reglas del prompt hacia un CLI determinista reduce en un 42% la sobrecarga de tokens fijos, liberando atención del modelo para la tarea real.
+En mi publicación [I cut my agents' fixed context by 42% and moved its test rules into a hash-checked CLI](https://dev.to/fgrandon/i-cut-my-agents-fixed-context-by-42-and-moved-its-test-rules-into-a-hash-checked-cli) se documenta la reducción de contexto y el paso de un sistema basado en prompts a un diseño con invariantes ejecutadas fuera del agente.
 
 ---
 
@@ -191,30 +193,32 @@ En mi publicación [I cut my agents' fixed context by 42% and moved its test rul
 
 ```text
 CLI Engine for Agent Governance/
-├── ag_ops.py                    # Motor CLI determinista ejecutable (v2.3)
-├── ag_ops_v2.py                 # Motor CLI de referencia v2.2
+├── ag_ops.py                    # Motor CLI determinista ejecutable (v2.3.0)
+├── ag_ops_v2.py                 # Motor CLI de referencia histórico y compatibilidad v2.2
 ├── CHANGELOG.md                 # Registro histórico de versiones y aprendizajes
 ├── README.md                    # Documentación técnica, arquitectura y guía
 ├── THREAT_MODEL.md              # Modelo de amenazas formal (3 adversarios, 3 garantías)
-├── test_ag_ops_v2.py            # Suite de auditoría de 12 defectos (stdlib unittest)
+├── test_ag_ops_v2.py            # Suite de auditoría de defectos y validación de invariantes
 ├── tests/
 │   ├── test_ag_ops_v2.py        # Suite automatizada de regresión v2.0
 │   ├── test_ag_ops_v2_1.py      # Suite integral de verificación v2.1
 │   └── test_ag_ops_v2_2.py      # Suite TDD de endurecimiento de fronteras v2.2
-└── docs/
-    ├── ARCHITECTURE_V2_2_AUTHORITY.md                               # Autoridad fuera del agente y anclaje CI
-    ├── INFORME_PRUEBAS_ag_ops_v2.md                                 # Hallazgos empíricos y análisis de latencia
-    ├── CHANGELOG - ag_ops.py.txt                                    # Notas de diseño e iteraciones de la v2.1
-    └── Matriz de verificacion - test autonomo y re-medidcion - ag_ops.py.txt  # Matriz de especificación
+├── docs/
+│   ├── ARCHITECTURE_V2_2_AUTHORITY.md                               # Autoridad fuera del agente y anclaje CI
+│   ├── INFORME_PRUEBAS_ag_ops_v2.md                                 # Hallazgos empíricos y análisis de latencia
+│   ├── CHANGELOG - ag_ops.py.txt                                    # Notas de diseño e iteraciones de la v2.1
+│   └── Matriz de verificacion - test autonomo y re-medidcion - ag_ops.py.txt  # Matriz de especificación
+└── LICENSE                      # MIT License
 ```
 
 ---
 
 ## 6. Próximos Pasos en el Laboratorio
 
-1. **Aislamiento de Permisos a Nivel de Sistema Operativo:** Diseñar mecanismos para que el directorio de recibos `.ag_state/` resida fuera del alcance de escritura directa del agente, blindando la contención física.
+1. **Aislamiento de Permisos a Nivel de Sistema Operativo:** Diseñar mecanismos para que el directorio de recibos `.ag_state/` resida fuera del alcance de escritura directa del agente, blindando la clave de integridad.
 2. **Optimización de Latencia en AST:** Reducir la latencia de `ast-lint` a menos de 15 ms por archivo en bases de código masivas.
 3. **Calibración Fina de `regret-mine`:** Ajustar heurísticas de commits de documentación y formato en repositorios con cientos de ramas concurrentes.
+4. **Extensión de la Verificación de Integridad:** Añadir más anclas de contexto y firmas de entorno para reforzar la defensa ante mutaciones de trabajo y rebases no autorizados.
 
 ---
 
