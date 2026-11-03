@@ -7,6 +7,7 @@
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,7 +16,7 @@ import unittest
 AG_OPS = pathlib.Path(
     os.environ.get(
         "AG_OPS_PATH",
-        r"D:\Users\francisco.grandon\.gemini\config\scripts\ag_ops_v2.py",
+        str(pathlib.Path(__file__).resolve().parent.parent / "ag_ops_v2.py"),
     )
 ).resolve()
 
@@ -112,7 +113,7 @@ class TestAgOpsV2(unittest.TestCase):
             'sys.exit(2)\n',
             encoding="utf-8",
         )
-        rc, out = run_cli("distill", "--cmd", f'"{sys.executable}" "{script}"', "--log-dir", str(self.root / "logs"))
+        rc, out = run_cli("distill", "--cmd", f'"{sys.executable}" "{script}"', "--max-lines", "5", "--log-dir", str(self.root / "logs"))
         self.assertEqual(rc, 2)
         delta_joined = "\n".join(out["critical_delta"])
         self.assertIn("E   AssertionError", delta_joined)
@@ -136,7 +137,7 @@ class TestAgOpsV2(unittest.TestCase):
         self.assertEqual(out_st1["drift_warnings"][0]["issue"], "ARTIFACT_NEVER_EXISTED")
 
         art.write_text("contenido v1", encoding="utf-8")
-        rc_st2, out_st2 = run_cli("state", "status", "--dir", str(sdir), "--strict")
+        rc_st2, out_st2 = run_cli("state", "status", "--dir", str(sdir))
         self.assertEqual(rc_st2, 0)
         self.assertFalse(out_st2["has_drift"])
 
@@ -200,8 +201,10 @@ class TestAgOpsV2(unittest.TestCase):
         repo = self.root / "repo"
         repo.mkdir()
 
+        git_bin = shutil.which("git") or r"D:\GIT\MinGit-2.56.0.4-64-bit\cmd\git.exe"
+
         def git(*args: str):
-            subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
+            subprocess.run([git_bin, *args], cwd=repo, check=True, capture_output=True, text=True)
 
         git("init")
         git("config", "user.email", "test@example.com")

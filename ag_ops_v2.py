@@ -3,25 +3,27 @@
 # Creado por Francisco Grandón Vergara
 # Licensed under the MIT License
 """
-ag_ops.py (v2) - Deterministic CLI Engine for Agent Governance, Merkle Guardrails,
+ag_ops.py (v2.2) - Deterministic CLI Engine for Agent Governance, Merkle Guardrails,
 Log Distillation, Lexical Runlevels, AST/DOT Validation, and Rapid-Regret Mining.
 """
 
 import argparse
 import ast
 import datetime
+import errno
 import fnmatch
 import hashlib
 import json
 import os
 import pathlib
 import re
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 
 # =============================================================================
@@ -39,7 +41,15 @@ def _atomic_write_json(path: pathlib.Path, data: Dict[str, Any]) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.flush()
-            os.fsync(f.fileno())
+            try:
+                os.fsync(f.fileno())
+            except OSError as exc:
+                if exc.errno not in (
+                    errno.EINVAL,
+                    getattr(errno, "ENOTSUP", 95),
+                    getattr(errno, "EOPNOTSUPP", 95),
+                ):
+                    raise
         os.replace(tmp_path, path)
     except BaseException:
         if os.path.exists(tmp_path):
@@ -54,7 +64,9 @@ def _sha256_file(path: pathlib.Path, normalize_eol: bool = False) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
         if normalize_eol:
-            content = f.read().replace(b"\r\n", b"\n")
+            content = f.read()
+            if b"\x00" not in content:
+                content = content.replace(b"\r\n", b"\n")
             h.update(content)
         else:
             for chunk in iter(lambda: f.read(65536), b""):
@@ -62,14 +74,43 @@ def _sha256_file(path: pathlib.Path, normalize_eol: bool = False) -> str:
     return h.hexdigest()
 
 
-def _run_command_isolated(cmd: str, timeout_sec: Optional[float] = None) -> Tuple[int, str, str, bool, float]:
+def _is_symlink_or_junction(p: pathlib.Path) -> bool:
+    """Detects symbolic links and NTFS junction points across POSIX and Windows."""
+    try:
+        if p.is_symlink() or os.path.islink(p):
+            return True
+        if hasattr(p, "is_junction") and p.is_junction():
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def _resolve_git_binary() -> str:
+    found = shutil.which("git")
+    if found:
+        return found
+    candidates = [
+        r"D:\GIT\MinGit-2.56.0.4-64-bit\cmd\git.exe",
+        r"C:\Program Files\Git\cmd\git.exe",
+        r"C:\Program Files (x86)\Git\cmd\git.exe",
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return "git"
+
+
+def _run_command_isolated(cmd: Union[str, List[str]], timeout_sec: Optional[float] = None) -> Tuple[int, str, str, bool, float]:
     """
-    Executes a shell command in an isolated process group, killing the entire
-    process tree on timeout so inherited stdout/stderr pipes never hang.
+    Executes a shell command (str) or direct argv command (List[str]) in an isolated
+    process group, killing the entire process tree on timeout so inherited stdout/stderr
+    pipes never hang.
     """
     t0 = time.perf_counter()
+    use_shell = isinstance(cmd, str)
     kwargs: Dict[str, Any] = {
-        "shell": True,
+        "shell": use_shell,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
@@ -134,16 +175,20 @@ def _compute_merkle_tree(
 ) -> Tuple[str, Dict[str, str]]:
     """
     Computes a deterministic SHA-256 Merkle manifest of files within test_dir.
-    Normalizes CRLF/LF on text files to prevent cross-platform Windows/POSIX drift.
-    Excludes only the exact state_dir and receipt_path, __pycache__ (.pyc/.pyo/.pyd),
-    root-level .pytest_cache, and explicit user-supplied --ignore patterns recorded
-    in the receipt.
+    Normalizes CRLF/LF on text files to prevent cross-platform Windows/POSIX drift,
+    while preserving raw byte hashes for binary files (containing NUL bytes).
+    Excludes only the exact state_dir (when nested inside test_dir) and receipt_path,
+    __pycache__ (.pyc/.pyo/.pyd), root-level .pytest_cache, and explicit user-supplied
+    --ignore patterns recorded in the receipt.
     """
+    if _is_symlink_or_junction(test_dir):
+        raise ValueError(f"Symlinks and junctions are forbidden in Merkle guard target: {test_dir}")
     test_dir = test_dir.resolve()
     if not test_dir.exists():
         raise FileNotFoundError(f"Test target does not exist: {test_dir}")
 
     resolved_state = state_dir.resolve() if state_dir else None
+    state_is_inside_test = bool(resolved_state and test_dir in resolved_state.parents)
     resolved_receipt = receipt_path.resolve() if receipt_path else None
     patterns = ignore_patterns or []
 
@@ -156,8 +201,11 @@ def _compute_merkle_tree(
             root_path = pathlib.Path(root).resolve()
             filtered_dirs: List[str] = []
             for d in sorted(dirs):
-                d_path = (root_path / d).resolve()
-                if resolved_state and d_path == resolved_state:
+                d_raw = root_path / d
+                if _is_symlink_or_junction(d_raw):
+                    raise ValueError(f"Symlinks and junctions are forbidden in Merkle guard target: {d_raw}")
+                d_path = d_raw.resolve()
+                if state_is_inside_test and resolved_state and d_path == resolved_state:
                     continue
                 if d == "__pycache__":
                     continue
@@ -172,10 +220,13 @@ def _compute_merkle_tree(
             for fname in files:
                 if fname.endswith((".pyc", ".pyo", ".pyd")):
                     continue
-                fpath = (root_path / fname).resolve()
+                fpath_raw = root_path / fname
+                if _is_symlink_or_junction(fpath_raw):
+                    raise ValueError(f"Symlinks and junctions are forbidden in Merkle guard target: {fpath_raw}")
+                fpath = fpath_raw.resolve()
                 if resolved_receipt and fpath == resolved_receipt:
                     continue
-                if resolved_state and resolved_state in fpath.parents:
+                if state_is_inside_test and resolved_state and resolved_state in fpath.parents:
                     continue
                 if fpath.is_file():
                     rel_posix = fpath.relative_to(test_dir).as_posix()
@@ -217,19 +268,23 @@ def _emit(payload: Dict[str, Any], as_json: bool, exit_code: int = 0) -> int:
 # =============================================================================
 
 def _validate_file_line_ref(ref: str) -> Tuple[bool, str]:
-    """Validates 'path/to/file.py:42' exists on disk and line is within bounds."""
+    """Validates 'path/to/file.py:42' exists on disk, is non-empty, and line is within bounds."""
     if ":" not in ref:
         return False, f"Reference '{ref}' must follow 'file:line' format."
     raw_path, raw_line = ref.rsplit(":", 1)
+    if not raw_path.strip():
+        return False, f"Reference '{ref}' is missing a file path."
     try:
         line_no = int(raw_line)
     except ValueError:
         return False, f"Invalid line number in '{ref}'."
-    fpath = pathlib.Path(raw_path).resolve()
+    fpath = pathlib.Path(raw_path.strip()).resolve()
     if not fpath.is_file():
         return False, f"Referenced file does not exist: {fpath}"
     total_lines = len(fpath.read_text(encoding="utf-8", errors="replace").splitlines())
-    if line_no < 1 or line_no > max(1, total_lines):
+    if total_lines == 0:
+        return False, f"Referenced file is empty (0 lines): {fpath.name}"
+    if line_no < 1 or line_no > total_lines:
         return False, f"Line {line_no} out of range (1..{total_lines}) in {fpath.name}"
     return True, f"{fpath.as_posix()}:{line_no}"
 
@@ -284,14 +339,25 @@ def _verify_constructive_witness(
                 None,
             )
         verified_options = []
+        seen_labels: Set[str] = set()
+        seen_anchors: Set[str] = set()
         for opt in raw_options:
             if "@" not in opt:
                 return False, f"INVALID_ARCH_FORK_PROOF: Option '{opt}' must include '@file:line' blast-radius anchor.", None
             label, ref = opt.split("@", 1)
+            clean_label = label.strip()
+            if not clean_label:
+                return False, f"INVALID_ARCH_FORK_PROOF: Option '{opt}' must have a non-empty option label before '@'.", None
             ok_ref, msg_ref = _validate_file_line_ref(ref.strip())
             if not ok_ref:
                 return False, f"INVALID_ARCH_FORK_PROOF: {msg_ref}", None
-            verified_options.append({"option": label.strip(), "anchor": msg_ref})
+            if clean_label in seen_labels:
+                return False, f"INVALID_ARCH_FORK_PROOF: Duplicate fork option label '{clean_label}'.", None
+            if msg_ref in seen_anchors:
+                return False, f"INVALID_ARCH_FORK_PROOF: Duplicate fork option blast-radius anchor '{msg_ref}'.", None
+            seen_labels.add(clean_label)
+            seen_anchors.add(msg_ref)
+            verified_options.append({"option": clean_label, "anchor": msg_ref})
         return True, "VALID", {"type": "arch-fork", "options": verified_options}
 
     return False, f"UNKNOWN_WITNESS_TYPE: {wtype}", None
@@ -314,7 +380,14 @@ def _record_guard_collision(receipt_path: pathlib.Path, receipt_data: Dict[str, 
 
 def _cmd_guard(args: argparse.Namespace) -> int:
     action = args.guard_action
-    test_path = pathlib.Path(args.test_dir).resolve()
+    raw_target = pathlib.Path(args.test_dir)
+    if _is_symlink_or_junction(raw_target):
+        return _emit(
+            {"ok": False, "error": f"GUARD_INIT_FAILED: Symlinks and junctions are forbidden in Merkle guard target: {raw_target}"},
+            args.json,
+            exit_code=1,
+        )
+    test_path = raw_target.resolve()
     if not test_path.exists():
         return _emit(
             {"ok": False, "error": f"TARGET_NOT_FOUND: Test target does not exist: {test_path}"},
@@ -333,7 +406,11 @@ def _cmd_guard(args: argparse.Namespace) -> int:
         if not cmd_str:
             return _emit({"ok": False, "error": "MISSING_CMD: --cmd is required for witness-red"}, args.json, exit_code=1)
 
-        pre_hash, pre_files = _compute_merkle_tree(test_path, state_dir, receipt_path, cli_ignore)
+        try:
+            pre_hash, pre_files = _compute_merkle_tree(test_path, state_dir, receipt_path, cli_ignore)
+        except (ValueError, OSError) as exc:
+            return _emit({"ok": False, "error": f"GUARD_INIT_FAILED: {exc}"}, args.json, exit_code=1)
+
         if not pre_files:
             return _emit(
                 {"ok": False, "error": f"EMPTY_TEST_TARGET: No files found to seal in {test_path}"},
@@ -388,7 +465,17 @@ def _cmd_guard(args: argparse.Namespace) -> int:
                 exit_code=1,
             )
 
-        tree_hash, files_map = _compute_merkle_tree(test_path, state_dir, receipt_path, cli_ignore)
+        try:
+            tree_hash, files_map = _compute_merkle_tree(test_path, state_dir, receipt_path, cli_ignore)
+        except (ValueError, OSError) as exc:
+            return _emit(
+                {
+                    "ok": False,
+                    "error": f"SELF_MUTATING_TEST_DIR: Test execution introduced forbidden filesystem state inside test_dir: {exc}",
+                },
+                args.json,
+                exit_code=1,
+            )
         if tree_hash != pre_hash:
             return _emit(
                 {
@@ -489,7 +576,29 @@ def _cmd_guard(args: argparse.Namespace) -> int:
                 exit_code=2,
             )
 
-        effective_ignore = cli_ignore if cli_ignore else list(saved_receipt.get("ignored_patterns", []))
+        saved_ignore = list(saved_receipt.get("ignored_patterns", []))
+        raw_cli_ignore = getattr(args, "ignore", "") or ""
+        if raw_cli_ignore.strip():
+            cli_ignore_list = _parse_ignore_patterns(raw_cli_ignore)
+            if sorted(cli_ignore_list) != sorted(saved_ignore):
+                _record_guard_collision(
+                    receipt_path,
+                    saved_receipt,
+                    "IGNORE_PATTERN_MISMATCH",
+                    {"witnessed_ignore": saved_ignore, "attempted_ignore": cli_ignore_list},
+                )
+                return _emit(
+                    {
+                        "ok": False,
+                        "error": f"IGNORE_PATTERN_MISMATCH: Provided --ignore patterns {cli_ignore_list} do not match witnessed patterns {saved_ignore}.",
+                        "witnessed_ignore": saved_ignore,
+                        "attempted_ignore": cli_ignore_list,
+                    },
+                    args.json,
+                    exit_code=2,
+                )
+
+        effective_ignore = saved_ignore
 
         cmd_to_run = args.cmd.strip() if args.cmd else saved_cmd
         if cmd_to_run != saved_cmd:
@@ -510,7 +619,10 @@ def _cmd_guard(args: argparse.Namespace) -> int:
                 exit_code=2,
             )
 
-        current_tree_hash, current_files = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
+        try:
+            current_tree_hash, current_files = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
+        except (ValueError, OSError) as exc:
+            return _emit({"ok": False, "error": f"GUARD_VERIFY_FAILED: {exc}"}, args.json, exit_code=1)
         if not current_files:
             return _emit(
                 {"ok": False, "error": f"EMPTY_TEST_TARGET: No files found in {test_path}"},
@@ -577,7 +689,10 @@ def _cmd_guard(args: argparse.Namespace) -> int:
                 exit_code=1,
             )
 
-        post_tree_hash, _ = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
+        try:
+            post_tree_hash, _ = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
+        except (ValueError, OSError) as exc:
+            return _emit({"ok": False, "error": f"GUARD_VERIFY_FAILED: {exc}"}, args.json, exit_code=1)
         if post_tree_hash != saved_tree_hash:
             _record_guard_collision(
                 receipt_path,
@@ -626,6 +741,7 @@ def _cmd_guard(args: argparse.Namespace) -> int:
         old_tree_hash = None
         old_cmd = None
         inherited_ignore: List[str] = []
+        renegotiated_at_iso = _utc_now_iso()
 
         if receipt_path.is_file():
             try:
@@ -642,13 +758,17 @@ def _cmd_guard(args: argparse.Namespace) -> int:
                 history = list(raw_history)
                 collisions = list(old_data.get("collisions", [])) if isinstance(old_data.get("collisions"), list) else []
                 inherited_ignore = list(old_data.get("ignored_patterns", []))
-                history.append({
+                hist_entry: Dict[str, Any] = {
                     "timestamp": old_data.get("timestamp_utc"),
+                    "renegotiated_at": renegotiated_at_iso,
                     "status": old_data.get("status"),
                     "reason": old_data.get("reason"),
                     "tree_hash": old_tree_hash,
                     "cmd": old_cmd,
-                })
+                }
+                if "constructive_witness" in old_data:
+                    hist_entry["constructive_witness"] = old_data["constructive_witness"]
+                history.append(hist_entry)
             except Exception as exc:
                 return _emit(
                     {
@@ -666,7 +786,10 @@ def _cmd_guard(args: argparse.Namespace) -> int:
         if not cmd_str:
             return _emit({"ok": False, "error": "MISSING_CMD: Test command is required for renegotiate"}, args.json, exit_code=1)
 
-        pre_hash, pre_files = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
+        try:
+            pre_hash, pre_files = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
+        except (ValueError, OSError) as exc:
+            return _emit({"ok": False, "error": f"GUARD_RENEGOTIATE_FAILED: {exc}"}, args.json, exit_code=1)
         if not pre_files:
             return _emit(
                 {"ok": False, "error": f"EMPTY_TEST_TARGET: No files found to seal in {test_path}"},
@@ -727,7 +850,17 @@ def _cmd_guard(args: argparse.Namespace) -> int:
                 exit_code=1,
             )
 
-        tree_hash, files_map = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
+        try:
+            tree_hash, files_map = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
+        except (ValueError, OSError) as exc:
+            return _emit(
+                {
+                    "ok": False,
+                    "error": f"SELF_MUTATING_TEST_DIR: Test execution introduced forbidden filesystem state during renegotiate: {exc}",
+                },
+                args.json,
+                exit_code=1,
+            )
         if tree_hash != pre_hash:
             return _emit(
                 {
@@ -741,7 +874,7 @@ def _cmd_guard(args: argparse.Namespace) -> int:
         new_receipt: Dict[str, Any] = {
             "version": 2,
             "status": "RENEGOTIATED_RED",
-            "timestamp_utc": _utc_now_iso(),
+            "timestamp_utc": renegotiated_at_iso,
             "test_target": str(test_path),
             "reason": reason,
             "cmd": cmd_str,
@@ -812,7 +945,7 @@ def _cmd_distill(args: argparse.Namespace) -> int:
     log_path = log_dir / f"raw_{timestamp_slug}.log"
     log_path.write_text(combined, encoding="utf-8", errors="replace")
 
-    all_lines = (stdout_txt + "\n" + stderr_txt).splitlines()
+    all_lines = stdout_txt.splitlines() + stderr_txt.splitlines()
     total_lines = len(all_lines)
 
     if timed_out:
@@ -849,23 +982,28 @@ def _cmd_distill(args: argparse.Namespace) -> int:
     critical_indices = [idx for idx, line in enumerate(all_lines) if _ERROR_LINE_RE.search(line)]
 
     extracted_lines: List[str] = []
-    if critical_indices:
+    if total_lines <= max_lines:
+        extracted_lines = list(all_lines)
+    elif critical_indices:
         first_err = critical_indices[0]
         head_budget = max(2, (max_lines - 1) // 3)
         tail_budget = max(2, max_lines - head_budget - 1)
 
         start_head = max(0, first_err - 2)
         end_head = min(total_lines, start_head + head_budget)
-        head_block = all_lines[start_head:end_head]
-
         tail_start = max(end_head, total_lines - tail_budget)
-        tail_block = all_lines[tail_start:]
 
-        extracted_lines = (
-            head_block
-            + (["... [intermediate lines pruned] ..."] if tail_start > end_head else [])
-            + tail_block
-        )
+        if tail_start > end_head:
+            head_block = all_lines[start_head:end_head]
+            tail_block = all_lines[tail_start:]
+            extracted_lines = (
+                head_block
+                + ["... [intermediate lines pruned] ..."]
+                + tail_block
+            )
+        else:
+            window_start = min(start_head, max(0, total_lines - max_lines))
+            extracted_lines = all_lines[window_start : window_start + max_lines]
     else:
         extracted_lines = all_lines[-max_lines:]
 
@@ -920,15 +1058,18 @@ def _cmd_state(args: argparse.Namespace) -> int:
 
         summary = (args.summary or "").strip()
         target_file = state_dir / f"{step_str}_{slug}.json"
-        conflicting = [
-            existing for existing in state_dir.glob(f"{step_str}_*.json")
-            if existing != target_file
-        ]
+        conflicting: List[pathlib.Path] = []
+        for existing in state_dir.iterdir():
+            if existing.is_file() and existing != target_file:
+                m = _STEP_FILE_RE.match(existing.name)
+                if m and int(m.group(1)) == step_num:
+                    conflicting.append(existing)
+        conflicting.sort(key=lambda p: p.name)
         if conflicting and not getattr(args, "replace", False):
             return _emit(
                 {
                     "ok": False,
-                    "error": f"STEP_CONFLICT: Step {step_str} already exists with a different slug ({[c.name for c in conflicting]}). Pass --replace to overwrite.",
+                    "error": f"STEP_CONFLICT: Step {step_str} already exists with a different filename ({[c.name for c in conflicting]}). Pass --replace to overwrite.",
                     "conflicting_files": [str(c) for c in conflicting],
                 },
                 args.json,
@@ -992,7 +1133,11 @@ def _cmd_state(args: argparse.Namespace) -> int:
         for _, _, fpath in candidates:
             try:
                 data = json.loads(fpath.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("State record must be a JSON object")
                 artifacts = data.get("artifacts", {})
+                if not isinstance(artifacts, dict):
+                    raise ValueError("'artifacts' field must be a JSON object")
                 dirty_record = False
                 for art_path_str, expected_hash in list(artifacts.items()):
                     art_path = pathlib.Path(art_path_str)
@@ -1007,7 +1152,7 @@ def _cmd_state(args: argparse.Namespace) -> int:
                                 "issue": "ARTIFACT_NEVER_EXISTED",
                             })
                     else:
-                        if not art_path.exists():
+                        if not art_path.is_file():
                             drift_warnings.append({
                                 "step": data.get("step"),
                                 "artifact": art_path_str,
@@ -1093,7 +1238,7 @@ class _AntigravityVisitor:
         self.is_test_file = _is_test_filepath(filename)
         self.violations: List[Dict[str, Any]] = []
         self.ttk_module_aliases: Set[str] = {"ttk", "tkinter.ttk"}
-        self.ttk_direct_imports: Set[str] = set()
+        self.ttk_direct_imports: Dict[str, str] = {}
 
     def check_tree(self, tree: ast.AST) -> None:
         """Fast two-pass ast.walk scan avoiding NodeVisitor.generic_visit getattr overhead."""
@@ -1135,9 +1280,10 @@ class _AntigravityVisitor:
         elif node.module == "tkinter.ttk":
             for alias in node.names:
                 if alias.name == "*":
-                    self.ttk_direct_imports.update(_TTK_WIDGETS)
-                else:
-                    self.ttk_direct_imports.add(alias.asname or alias.name)
+                    for w in _TTK_WIDGETS:
+                        self.ttk_direct_imports[w] = w
+                elif alias.name in _TTK_WIDGETS:
+                    self.ttk_direct_imports[alias.asname or alias.name] = alias.name
         elif node.module in ("unittest.mock", "mock") and not self.is_test_file:
             self.violations.append({
                 "file": self.filename,
@@ -1146,15 +1292,33 @@ class _AntigravityVisitor:
                 "message": f"Mocking primitives from '{node.module}' imported in production module.",
                 "reflex": "Remove unittest.mock imports from production modules; pass dependencies via constructor or callable parameters.",
             })
+        elif node.module == "unittest" and not self.is_test_file:
+            for alias in node.names:
+                if alias.name == "mock":
+                    self.violations.append({
+                        "file": self.filename,
+                        "line": node.lineno,
+                        "rule": "PATH002",
+                        "message": "Mocking module 'unittest.mock' imported in production module.",
+                        "reflex": "Remove unittest.mock imports from production modules; pass dependencies via constructor or callable parameters.",
+                    })
 
     def _check_except_handler(self, node: ast.ExceptHandler) -> None:
         """
-        Rule PATH001: Catches silent exception swallowing (`except:` or `except Exception:`
-        followed solely by `pass` or `...`) which masks broken path invariants.
+        Rule PATH001: Catches silent broad exception swallowing (`except:` or `except Exception:`
+        followed solely by `pass`, `...`, `continue`, or trivial returns like `return {}`,
+        `return None`, `return []`) which masks broken path invariants.
         """
-        is_broad = node.type is None or (
-            isinstance(node.type, ast.Name) and node.type.id in ("Exception", "BaseException")
-        )
+        is_broad = False
+        if node.type is None:
+            is_broad = True
+        elif isinstance(node.type, ast.Name) and node.type.id in ("Exception", "BaseException"):
+            is_broad = True
+        elif isinstance(node.type, ast.Tuple):
+            is_broad = any(
+                isinstance(elt, ast.Name) and elt.id in ("Exception", "BaseException")
+                for elt in node.type.elts
+            )
         if is_broad and len(node.body) == 1:
             stmt = node.body[0]
             is_noop = isinstance(stmt, ast.Pass) or (
@@ -1162,17 +1326,39 @@ class _AntigravityVisitor:
                 and isinstance(stmt.value, ast.Constant)
                 and stmt.value.value is Ellipsis
             )
-            if is_noop:
+            is_continue = isinstance(stmt, ast.Continue)
+            is_trivial_return = False
+            if isinstance(stmt, ast.Return):
+                if stmt.value is None:
+                    is_trivial_return = True
+                elif isinstance(stmt.value, ast.Dict) and len(stmt.value.keys) == 0:
+                    is_trivial_return = True
+                elif isinstance(stmt.value, (ast.List, ast.Tuple, ast.Set)) and len(stmt.value.elts) == 0:
+                    is_trivial_return = True
+                elif isinstance(stmt.value, ast.Constant) and stmt.value.value in (None, False, ""):
+                    is_trivial_return = True
+
+            if is_noop or is_continue or is_trivial_return:
+                if is_continue:
+                    detail = "continue"
+                elif is_trivial_return:
+                    if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Dict):
+                        detail = "return {}"
+                    else:
+                        detail = "trivial return"
+                else:
+                    detail = "pass"
+
                 self.violations.append({
                     "file": self.filename,
                     "line": node.lineno,
                     "rule": "PATH001",
-                    "message": "Silent broad exception swallowing ('except: pass') hides broken path invariants.",
+                    "message": f"Silent broad exception swallowing ('except: {detail}') hides broken path invariants.",
                     "reflex": "Catch a specific exception type and log/handle the failure context, or re-raise the error.",
                 })
 
     def _check_call(self, node: ast.Call) -> None:
-        func_name = ""
+        widget_canonical = ""
         is_ttk = False
 
         if isinstance(node.func, ast.Attribute):
@@ -1180,10 +1366,12 @@ class _AntigravityVisitor:
             prefix = _dotted_name(node.func.value)
             if prefix in self.ttk_module_aliases and func_name in _TTK_WIDGETS:
                 is_ttk = True
+                widget_canonical = func_name
         elif isinstance(node.func, ast.Name):
             func_name = node.func.id
             if func_name in self.ttk_direct_imports:
                 is_ttk = True
+                widget_canonical = self.ttk_direct_imports[func_name]
 
         # Rule TK002: forbidden background/foreground on confirmed ttk widgets only
         if is_ttk:
@@ -1193,8 +1381,8 @@ class _AntigravityVisitor:
                         "file": self.filename,
                         "line": node.lineno,
                         "rule": "TK002",
-                        "message": f"Direct '{kw.arg}=' argument forbidden on ttk.{func_name}. Use ttk.Style() or tk equivalent.",
-                        "reflex": f"Configure '{kw.arg}' via ttk.Style().configure('<Style>.T{func_name}', ...) or switch to tk.{func_name}.",
+                        "message": f"Direct '{kw.arg}=' argument forbidden on ttk.{widget_canonical}. Use ttk.Style() or tk equivalent.",
+                        "reflex": f"Configure '{kw.arg}' via ttk.Style().configure('<Style>.T{widget_canonical}', ...) or switch to tk.{widget_canonical}.",
                     })
 
         # Rule TK001: float font size check
@@ -1226,6 +1414,49 @@ class _AntigravityVisitor:
                 })
 
 
+def _strip_dot_comments_preserve_lines(source: str) -> str:
+    """Strips /* ... */, //..., and #... comments outside quotes while preserving newline counts."""
+    out: List[str] = []
+    i = 0
+    n = len(source)
+    in_quotes = False
+    while i < n:
+        ch = source[i]
+        if in_quotes:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(source[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_quotes = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_quotes = True
+            out.append(ch)
+            i += 1
+        elif source.startswith("/*", i):
+            end_idx = source.find("*/", i + 2)
+            if end_idx == -1:
+                segment = source[i:]
+                out.append("\n" * segment.count("\n"))
+                break
+            segment = source[i : end_idx + 2]
+            out.append("\n" * segment.count("\n"))
+            i = end_idx + 2
+        elif source.startswith("//", i) or ch == "#":
+            nl_idx = source.find("\n", i)
+            if nl_idx == -1:
+                break
+            i = nl_idx
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def _lint_dot_state_machine(dot_path: pathlib.Path) -> List[Dict[str, Any]]:
     """
     Validates Graphviz DOT state machine files against SCAR-PROC-152 & SCAR-ASYNC-01:
@@ -1236,38 +1467,67 @@ def _lint_dot_state_machine(dot_path: pathlib.Path) -> List[Dict[str, Any]]:
     """
     violations: List[Dict[str, Any]] = []
     try:
-        source = dot_path.read_text(encoding="utf-8", errors="replace")
+        raw_source = dot_path.read_text(encoding="utf-8", errors="replace")
     except Exception as exc:
         return [{"file": str(dot_path), "line": 1, "rule": "IO_ERROR", "message": str(exc)}]
 
-    edge_re = re.compile(r'^[ \t]*"?([A-Za-z0-9_]+)"?[ \t]*->[ \t]*"?([A-Za-z0-9_]+)"?[ \t]*(?:\[(.*?)\])?', re.M)
-    node_attr_re = re.compile(r'^[ \t]*"?([A-Za-z0-9_]+)"?[ \t]*\[(.*?)\]', re.M)
+    source = _strip_dot_comments_preserve_lines(raw_source)
 
-    out_edges: Dict[str, List[Tuple[str, str]]] = {}
+    endpoint_pat = r'(?:"?[A-Za-z0-9_]+"?|\{[^{}]*\})'
+    edge_chain_re = re.compile(
+        rf'^[ \t]*((?:{endpoint_pat}[ \t]*->[ \t]*)+{endpoint_pat})[ \t]*(?:\[([^\]]*)\])?',
+        re.M,
+    )
+    node_token_re = re.compile(r'"?([A-Za-z0-9_]+)"?')
+    node_attr_re = re.compile(r'^[ \t]*"?([A-Za-z0-9_]+)"?[ \t]*\[([^\]]*)\]', re.M)
+    guard_pred_re = re.compile(r"\bguard\s*:\s*[^\]\s,;\"']+", re.I)
+
+    out_edges: Dict[str, List[Tuple[str, str, int]]] = {}
     in_degree: Dict[str, int] = {}
     nodes: List[str] = []
+    node_lines: Dict[str, int] = {}
     async_nodes: Set[str] = set()
 
-    def _register_node(name: str) -> None:
+    def _line_at(offset: int) -> int:
+        return source.count("\n", 0, offset) + 1
+
+    def _register_node(name: str, line_no: int) -> None:
         if name not in nodes:
             nodes.append(name)
+            node_lines[name] = line_no
 
     for m in node_attr_re.finditer(source):
         node_name, attrs = m.group(1), m.group(2)
         if node_name.lower() in ("node", "edge", "graph", "digraph", "subgraph"):
             continue
-        _register_node(node_name)
+        line_no = _line_at(m.start())
+        _register_node(node_name, line_no)
         if "parallelogram" in attrs or "async=true" in attrs or node_name.startswith(("Awaiting", "Fetching", "Stream", "Loading")):
             async_nodes.add(node_name)
 
-    for m in edge_re.finditer(source):
-        src, dst, attrs = m.group(1), m.group(2), m.group(3) or ""
-        _register_node(src)
-        _register_node(dst)
-        out_edges.setdefault(src, []).append((dst, attrs))
-        in_degree[dst] = in_degree.get(dst, 0) + 1
-        if src.startswith(("Awaiting", "Fetching", "Stream", "Loading")):
-            async_nodes.add(src)
+    for m in edge_chain_re.finditer(source):
+        chain_str, attrs = m.group(1), m.group(2) or ""
+        line_no = _line_at(m.start())
+        chain_groups: List[List[str]] = []
+        for part in chain_str.split("->"):
+            part_str = part.strip()
+            if part_str.startswith("{") and part_str.endswith("}"):
+                grp = [t.group(1) for t in node_token_re.finditer(part_str[1:-1])]
+            else:
+                tok = node_token_re.search(part_str)
+                grp = [tok.group(1)] if tok else []
+            if grp:
+                chain_groups.append(grp)
+        for grp in chain_groups:
+            for n in grp:
+                _register_node(n, line_no)
+                if n.startswith(("Awaiting", "Fetching", "Stream", "Loading")):
+                    async_nodes.add(n)
+        for idx in range(len(chain_groups) - 1):
+            for src in chain_groups[idx]:
+                for dst in chain_groups[idx + 1]:
+                    out_edges.setdefault(src, []).append((dst, attrs, line_no))
+                    in_degree[dst] = in_degree.get(dst, 0) + 1
 
     if not nodes:
         return violations
@@ -1279,10 +1539,11 @@ def _lint_dot_state_machine(dot_path: pathlib.Path) -> List[Dict[str, Any]]:
     for n in nodes:
         outs = out_edges.get(n, [])
         ins = in_degree.get(n, 0)
+        n_line = node_lines.get(n, 1)
         if n not in initial_nodes and ins == 0:
             violations.append({
                 "file": str(dot_path),
-                "line": 1,
+                "line": n_line,
                 "rule": "DOT002",
                 "message": f"Unreachable state: '{n}' has in-degree 0 and is not an initial state.",
                 "reflex": f"Connect an incoming transition into '{n}' or remove the orphan state node.",
@@ -1290,7 +1551,7 @@ def _lint_dot_state_machine(dot_path: pathlib.Path) -> List[Dict[str, Any]]:
         if n.lower() not in terminal_names and len(outs) == 0:
             violations.append({
                 "file": str(dot_path),
-                "line": 1,
+                "line": n_line,
                 "rule": "DOT001",
                 "message": f"Deadlock risk: Non-terminal state '{n}' has out-degree 0.",
                 "reflex": f"Add at least one outgoing transition from '{n}' or rename it as a terminal sink.",
@@ -1298,23 +1559,24 @@ def _lint_dot_state_machine(dot_path: pathlib.Path) -> List[Dict[str, Any]]:
 
     for an in sorted(async_nodes):
         outs = out_edges.get(an, [])
+        an_line = node_lines.get(an, 1)
         has_teardown = any(
             any(k in dst.lower() or k in attrs.lower() for k in exit_keywords)
-            for dst, attrs in outs
+            for dst, attrs, _ in outs
         )
         if len(outs) < 2 or not has_teardown:
             violations.append({
                 "file": str(dot_path),
-                "line": 1,
+                "line": an_line,
                 "rule": "SCAR-PROC-152",
                 "message": f"Async state '{an}' lacks explicit teardown/cancel/error exit edge (out-degree={len(outs)}).",
                 "reflex": f"Add an explicit transition from '{an}' to a Disposed, Cancelled, or Error state.",
             })
-        for dst, attrs in outs:
-            if not any(k in dst.lower() for k in exit_keywords) and "guard:" not in attrs:
+        for dst, attrs, edge_line in outs:
+            if not any(k in dst.lower() for k in exit_keywords) and not guard_pred_re.search(attrs):
                 violations.append({
                     "file": str(dot_path),
-                    "line": 1,
+                    "line": edge_line,
                     "rule": "SCAR-ASYNC-01",
                     "message": f"Late-arrival zombie race on '{an} -> {dst}': missing '[guard: ...]' predicate on edge label.",
                     "reflex": f'Add a cancellation/epoch guard on the resolution edge, e.g. {an} -> {dst} [label="onResolve [guard: !isClosed && reqId == activeReqId]"].',
@@ -1340,7 +1602,7 @@ def _load_context_signatures(context_map_path: Optional[str]) -> Dict[str, Dict[
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
-    except Exception:
+    except (OSError, json.JSONDecodeError):
         return {}
 
 
@@ -1482,6 +1744,11 @@ def _cmd_ast_lint(args: argparse.Namespace) -> int:
         payload["probationary_count"] = len(probationary_warnings)
         payload["probationary_warnings"] = probationary_warnings
 
+    if getattr(args, "strict", False) and probationary_warnings:
+        payload["ok"] = False
+        payload["error"] = "STRICT_PROBATIONARY: Findings degraded to probationary status rejected under --strict."
+        return _emit(payload, args.json, exit_code=2)
+
     return _emit(
         payload,
         args.json,
@@ -1498,24 +1765,91 @@ _REFACTOR_VERB_RE = re.compile(r"\b(refactor|refactoring|simplify|cleanup|clean\
 _CONTROL_GUARD_RE = re.compile(r"^\s*(if|elif|else|raise|assert|except)\b")
 
 
+def _strip_leading_docstring(body: List[ast.stmt]) -> List[ast.stmt]:
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        return body[1:]
+    return body
+
+
+class _FuncHashVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.scope: List[str] = []
+        self.defs: Dict[str, str] = {}
+
+    def _hash_func_node(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> str:
+        stripped_body = _strip_leading_docstring(node.body)
+        if isinstance(node, ast.AsyncFunctionDef):
+            clone: Union[ast.FunctionDef, ast.AsyncFunctionDef] = ast.AsyncFunctionDef(
+                name=node.name,
+                args=node.args,
+                body=stripped_body,
+                decorator_list=node.decorator_list,
+                returns=node.returns,
+                type_comment=getattr(node, "type_comment", None),
+            )
+        else:
+            clone = ast.FunctionDef(
+                name=node.name,
+                args=node.args,
+                body=stripped_body,
+                decorator_list=node.decorator_list,
+                returns=node.returns,
+                type_comment=getattr(node, "type_comment", None),
+            )
+        body_dump = ast.dump(clone, include_attributes=False)
+        return hashlib.sha256(body_dump.encode("utf-8")).hexdigest()
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.scope.append(node.name)
+        self.generic_visit(node)
+        self.scope.pop()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        qualified_name = ".".join(self.scope + [node.name]) if self.scope else node.name
+        self.defs[qualified_name] = self._hash_func_node(node)
+        self.scope.append(node.name)
+        self.generic_visit(node)
+        self.scope.pop()
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        qualified_name = ".".join(self.scope + [node.name]) if self.scope else node.name
+        self.defs[qualified_name] = self._hash_func_node(node)
+        self.scope.append(node.name)
+        self.generic_visit(node)
+        self.scope.pop()
+
+
 def _extract_ast_function_hashes(py_source: str) -> Dict[str, str]:
-    """Maps qualified function/method names to normalized AST body SHA-256 hashes."""
-    defs: Dict[str, str] = {}
+    """Maps qualified function/method names (e.g. ClassName.method) to normalized AST body SHA-256 hashes."""
     try:
         tree = ast.parse(py_source)
     except SyntaxError:
-        return defs
+        return {}
 
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            body_dump = ast.dump(node, include_attributes=False)
-            defs[node.name] = hashlib.sha256(body_dump.encode("utf-8")).hexdigest()
-    return defs
+    visitor = _FuncHashVisitor()
+    visitor.visit(tree)
+    return visitor.defs
 
 
 def _git_changed_line_sets(repo_path: pathlib.Path, commit_sha: str, rel_file: str) -> Tuple[Set[str], Set[str]]:
     """Returns (added_lines, deleted_lines) stripped of whitespace for a file in a commit."""
-    cmd = f'git -C "{repo_path}" show --format="" --unified=0 {commit_sha} -- "{rel_file}"'
+    git_bin = _resolve_git_binary()
+    cmd = [
+        git_bin,
+        "-C", str(repo_path),
+        "-c", "core.quotepath=false",
+        "show",
+        "--format=",
+        "--unified=0",
+        commit_sha,
+        "--",
+        rel_file,
+    ]
     rc, out, _, _, _ = _run_command_isolated(cmd, timeout_sec=5.0)
     added: Set[str] = set()
     deleted: Set[str] = set()
@@ -1535,25 +1869,44 @@ def _git_changed_line_sets(repo_path: pathlib.Path, commit_sha: str, rel_file: s
     return added, deleted
 
 
+def _parse_iso_utc_ts(ts_str: str) -> Optional[int]:
+    if not ts_str or not isinstance(ts_str, str):
+        return None
+    try:
+        dt = datetime.datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+        return int(dt.timestamp())
+    except ValueError:
+        return None
+
+
 def _load_receipt_collision_timestamps(state_dir: Optional[pathlib.Path]) -> List[int]:
     """Extracts Unix timestamps of guard collisions and renegotiations from .ag_state."""
     if not state_dir or not state_dir.is_dir():
         return []
-    timestamps: List[int] = []
+    timestamps: Set[int] = set()
     for fpath in state_dir.glob("merkle_guard_*.json"):
         try:
             data = json.loads(fpath.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
             for col in data.get("collisions", []):
-                ts_str = col.get("timestamp_utc", "")
-                if ts_str:
-                    dt = datetime.datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-                    timestamps.append(int(dt.timestamp()))
-            for ren in data.get("renegotiation_history", []):
-                ts_str = ren.get("timestamp", "")
-                if ts_str:
-                    dt = datetime.datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-                    timestamps.append(int(dt.timestamp()))
-        except Exception:
+                if isinstance(col, dict):
+                    ts_val = _parse_iso_utc_ts(col.get("timestamp_utc", ""))
+                    if ts_val is not None:
+                        timestamps.add(ts_val)
+            raw_hist = data.get("renegotiation_history", [])
+            if isinstance(raw_hist, list):
+                for ren in raw_hist:
+                    if isinstance(ren, dict):
+                        for key in ("renegotiated_at", "timestamp"):
+                            ts_val = _parse_iso_utc_ts(ren.get(key, ""))
+                            if ts_val is not None:
+                                timestamps.add(ts_val)
+                if len(raw_hist) > 0 or data.get("status") == "RENEGOTIATED_RED":
+                    ts_val = _parse_iso_utc_ts(data.get("timestamp_utc", ""))
+                    if ts_val is not None:
+                        timestamps.add(ts_val)
+        except (OSError, json.JSONDecodeError, ValueError):
             continue
     return sorted(timestamps)
 
@@ -1579,7 +1932,16 @@ def _cmd_regret_mine(args: argparse.Namespace) -> int:
     state_dir = pathlib.Path(args.state_dir).resolve() if getattr(args, "state_dir", None) else (repo_path / ".ag_state")
     receipt_events_ts = _load_receipt_collision_timestamps(state_dir)
 
-    git_cmd = f'git -C "{repo_path}" log -n {limit} --format="COMMIT|%H|%ct|%s" --name-only'
+    git_bin = _resolve_git_binary()
+    git_cmd = [
+        git_bin,
+        "-C", str(repo_path),
+        "-c", "core.quotepath=false",
+        "log",
+        "-n", str(limit),
+        "--format=COMMIT|%H|%ct|%s",
+        "--name-only",
+    ]
     rc, out, err, _, _ = _run_command_isolated(git_cmd, timeout_sec=15.0)
     if rc != 0:
         return _emit({"ok": False, "error": f"GIT_LOG_FAILED: {err.strip()}"}, args.json, exit_code=1)
@@ -1615,6 +1977,9 @@ def _cmd_regret_mine(args: argparse.Namespace) -> int:
             delta_sec = newer["ts"] - older["ts"]
             if delta_sec > window_sec:
                 break
+            if delta_sec < 0 and abs(delta_sec) > window_sec:
+                continue
+            abs_delta_sec = abs(delta_sec)
 
             shared_py = (set(newer["py_files"]) & set(older["py_files"])) - paired_files
             if not shared_py:
@@ -1623,8 +1988,14 @@ def _cmd_regret_mine(args: argparse.Namespace) -> int:
             for rel_file in sorted(shared_py):
                 paired_files.add(rel_file)
 
-                _, src_new, _, _, _ = _run_command_isolated(f'git -C "{repo_path}" show {newer["sha"]}:"{rel_file}"', 5.0)
-                _, src_old, _, _, _ = _run_command_isolated(f'git -C "{repo_path}" show {older["sha"]}:"{rel_file}"', 5.0)
+                _, src_new, _, _, _ = _run_command_isolated(
+                    [git_bin, "-C", str(repo_path), "-c", "core.quotepath=false", "show", f'{newer["sha"]}:{rel_file}'],
+                    5.0,
+                )
+                _, src_old, _, _, _ = _run_command_isolated(
+                    [git_bin, "-C", str(repo_path), "-c", "core.quotepath=false", "show", f'{older["sha"]}:{rel_file}'],
+                    5.0,
+                )
                 defs_new = _extract_ast_function_hashes(src_new)
                 defs_old = _extract_ast_function_hashes(src_old)
                 overlapping_funcs = [
@@ -1642,7 +2013,8 @@ def _cmd_regret_mine(args: argparse.Namespace) -> int:
                     signals.append("FIX_VERB_INTENT")
                 if len(newer["test_files"]) > 0:
                     signals.append("TEST_ASSERTION_DELTA")
-                if any(older["ts"] <= ev_ts <= newer["ts"] for ev_ts in receipt_events_ts):
+                low_ts, high_ts = min(older["ts"], newer["ts"]), max(older["ts"], newer["ts"])
+                if any(low_ts <= ev_ts <= high_ts for ev_ts in receipt_events_ts):
                     signals.append("GUARD_COLLISION_RECEIPT")
 
                 if not is_pure_refactor:
@@ -1660,7 +2032,7 @@ def _cmd_regret_mine(args: argparse.Namespace) -> int:
                 regret_pairs.append({
                     "file": rel_file,
                     "overlapping_functions": overlapping_funcs,
-                    "delta_minutes": round(delta_sec / 60.0, 2),
+                    "delta_minutes": round(abs_delta_sec / 60.0, 2),
                     "initial_commit": older["sha"][:8],
                     "regret_commit": newer["sha"][:8],
                     "regret_subject": newer["subject"],
@@ -1741,6 +2113,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_lint.add_argument("--author", default=None, help="Optional author string to enforce in file headers (AUTH001).")
     p_lint.add_argument("--include-dot", action="store_true", help="Also lint .dot state machine files when target is a directory.")
     p_lint.add_argument("--context-map", default=None, help="Path to JSON mapping rule IDs to anchor file SHA-256 signatures.")
+    p_lint.add_argument("--strict", action="store_true", help="Rejects probationary findings with STRICT_PROBATIONARY (exit code 2) if anchor drift occurred.")
     p_lint.add_argument("--json", action="store_true", help="Emit deterministic JSON.")
 
     # 5. regret-mine
