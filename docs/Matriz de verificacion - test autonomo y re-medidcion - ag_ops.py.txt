@@ -1,0 +1,36 @@
+Para verificar que cada cambio de ag_ops_2.py cumple su contrato sin regresiones, divide las pruebas en cinco bloques (uno por subcomando) y ejecútalos con una suite automatizada que valide tanto los códigos de salida (0, 1, 2, 124) como el JSON emitido.   
+
+1. Matriz de verificación por bloque
+
+- guard (Puntos 1–4 + SCAR-PROC-150 + registro de colisiones):
+	- No colisión de recibos (Punto 1): sellar tests/test_a.py y tests/test_b.py en la misma carpeta y comprobar que se crean dos archivos merkle_guard_<hash>.json distintos en .ag_state/, 	permitiendo hacer verify-green de a tras sellar b.   
+	- Exclusiones estrictas y --ignore (Punto 2): crear tests/sub/datos.tmp o tests/.hypothesis/x después de witness-red y comprobar que verify-green falla con EACCES_TEST_TAMPERING (exit 	2, reportando ADDED:sub/datos.tmp), salvo que se haya sellado con --ignore "*.tmp".   
+	- Directorio vacío (Punto 3): ejecutar witness-red sobre una carpeta vacía y comprobar que devuelve exit 1 con EMPTY_TEST_TARGET.   
+	- Integridad de recibo v2 y comando (Punto 4): borrar "cmd" o cambiar "version": 1 en el JSON del recibo y comprobar que verify-green devuelve exit 2 (CORRUPTED_RECEIPT). 	Corromper el JSON antes de renegotiate y verificar que aborta con exit 2 en vez de reiniciar el historial en blanco.   
+	- Colisiones y Constructive Witness (SCAR-PROC-150): provocar un fallo en verify-green y comprobar que el recibo incrementa la lista "collisions". Ejecutar renegotiate --require-witness 	solo con --reason y verificar que rechaza la retractación perezosa (LAZY_RETRACTION_REJECTED), pero pasa al entregar --witness-type spec-collision con dos referencias archivo:línea 	válidas.   
+- distill (Punto 7):
+	- Ejecutar un comando que imprima "DONE   all good" antes de un AssertionError: real y fallar con exit 1; comprobar que critical_delta ancla en el AssertionError: y no en "DONE   ", y que 	el código de salida del proceso es 1.   
+- state (Punto 8):
+	- Ciclo NOT_FOUND $\rightarrow$ sellado: registrar un paso apuntando a un artefacto que aún no existe (status debe reportar ARTIFACT_NEVER_EXISTED), crear luego el archivo, correr 	status (debe sellar su SHA-256 automáticamente) y después borrarlo (ahora debe reportar FILE_DELETED).   
+	- Flags --status, --strict y --replace: comprobar que --status INVALIDO devuelve exit 1; que status --strict devuelve exit 2 cuando hay drift; y que escribir el mismo --step con otro --name falla 	con STEP_CONFLICT (exit 1) salvo que se pase --replace.   
+- ast-lint (Puntos 9–10 + PATH001/PATH002 + ContextSignature + .dot):
+	- Precisión de TK002 (Punto 9): comprobar que import tkinter.ttk; tkinter.ttk.Label(root, bg="red") marca TK002, mientras que una función propia ttk_helper(bg="red") y tk.Label(root, 	bg="red") pasan limpios.   
+	- Autoría opcional (Punto 10): correr ast-lint sin --author sobre un archivo sin cabecera y verificar exit 0; correrlo con --author "Francisco Grandón" y verificar que marca AUTH001. 
+	- Invariantes de camino (PATH001 / PATH002) y ContextSignature: verificar que except Exception: pass marca PATH001 con campo "reflex", que from unittest.mock import MagicMock 	fuera de tests/ marca PATH002, y que al pasar --context-map con un hash distinto para TK002, la violación pasa a probationary_warnings (autoimmune_drift: true) y el comando sale con 	exit 0.   
+	- Máquinas de estado .dot (DOT001, DOT002, SCAR-PROC-152, SCAR-ASYNC-01): pasar un archivo .dot con un nodo Fetching sin arista de error/cancelación ni [guard: ...] y comprobar que detecta ambas reglas.   
+- regret-mine (Target 90):En un repositorio Git temporal, crear 3 commits: C1 (función inicial), C2 (refactor limpio de la misma función sin tocar tests ni usar verbo fix) y C3 (fix: edge case modificando la misma función). Comprobar que regret-mine filtra C1 -> C2 (tdd_refactors_filtered: 1) y reporta únicamente C2 -> C3 con FIX_VERB_INTENT.   
+
+
+2. Suite de pruebas autónoma (test_ag_ops_v2.py) "D:\Users\francisco.grandon\.gemini\config\scripts\test_ag_ops_v2.py" (o pasa la ruta en la variable de entorno AG_OPS_PATH) y ejecútalo con python test_ag_ops_v2.py
+
+3. Re-medición para el artículo (Punto 6)
+Una vez que la suite anterior pase en verde, ejecuta estos tres comandos en PowerShell para obtener las cifras definitivas con las que actualizarás el texto de DEV.to antes de cambiar published: true:
+
+# 1. Conteo exacto de líneas de ag_ops.py v2
+(Get-Content "D:\Users\francisco.grandon\.gemini\config\scripts\ag_ops.py").Count
+
+# 2. Latencia real de ast-lint sobre un archivo único y sobre un directorio
+python "D:\Users\francisco.grandon\.gemini\config\scripts\ag_ops.py" ast-lint "D:\Users\francisco.grandon\.gemini\config\scripts\ag_ops.py" --json
+
+# 3. Prueba de regret-mine sobre tu propio repositorio
+python "D:\Users\francisco.grandon\.gemini\config\scripts\ag_ops.py" regret-mine --repo . --window-min 60 --json
