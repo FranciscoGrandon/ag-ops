@@ -8,6 +8,10 @@ __pycache__/
 *.tmp
 *.bak
 logs/
+.coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Environments
 .venv/
