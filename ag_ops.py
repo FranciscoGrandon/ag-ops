@@ -10,6 +10,7 @@ AST/DOT Validation, Scope/Cycle Governance, and Rapid-Regret Mining.
 
 import argparse
 import ast
+import collections
 import configparser
 import copy
 import datetime
@@ -1087,6 +1088,165 @@ def _extract_test_execution_counts(
     return None
 
 
+def _git_merge_base(repo_root: pathlib.Path, ref_a: str, ref_b: str = "HEAD") -> Optional[str]:
+    git_bin = _resolve_git_binary()
+    rc, out, _, _, _ = _run_command_isolated(
+        [git_bin, "-C", str(repo_root), "merge-base", ref_a, ref_b],
+        timeout_sec=5.0,
+    )
+    if rc != 0 or not out.strip():
+        return None
+    return out.strip()
+
+
+def _git_is_ancestor(repo_root: pathlib.Path, ancestor_sha: str, descendant_ref: str = "HEAD") -> bool:
+    git_bin = _resolve_git_binary()
+    rc, _, _, _, _ = _run_command_isolated(
+        [git_bin, "-C", str(repo_root), "merge-base", "--is-ancestor", ancestor_sha, descendant_ref],
+        timeout_sec=5.0,
+    )
+    return rc == 0
+
+
+def _extract_cited_spec_files(args: argparse.Namespace, repo_root: pathlib.Path) -> List[str]:
+    raw_refs: List[str] = []
+    for attr in ("conflict_a", "conflict_b"):
+        val = (getattr(args, attr, "") or "").strip()
+        if val and ":" in val:
+            raw_refs.append(val.rsplit(":", 1)[0].strip())
+    raw_fork = (getattr(args, "fork_options", "") or "").strip()
+    if raw_fork:
+        for opt in raw_fork.split("|"):
+            opt = opt.strip()
+            if "@" in opt:
+                ref_part = opt.split("@", 1)[1].strip()
+                if ":" in ref_part:
+                    raw_refs.append(ref_part.rsplit(":", 1)[0].strip())
+
+    rel_files: Set[str] = set()
+    for raw_p in raw_refs:
+        if not raw_p:
+            continue
+        p = pathlib.Path(raw_p).resolve()
+        try:
+            rel_files.add(p.relative_to(repo_root).as_posix())
+        except ValueError:
+            pass
+    return sorted(rel_files)
+
+
+def _check_specs_modified_since_base(
+    repo_root: pathlib.Path,
+    merge_base_sha: str,
+    cited_rel_files: List[str],
+) -> List[str]:
+    if not cited_rel_files:
+        return []
+    git_bin = _resolve_git_binary()
+    modified: Set[str] = set()
+    for diff_args in (
+        [git_bin, "-C", str(repo_root), "-c", "core.quotepath=false", "diff", "--name-only", merge_base_sha, "HEAD", "--", *cited_rel_files],
+        [git_bin, "-C", str(repo_root), "-c", "core.quotepath=false", "diff", "--name-only", merge_base_sha, "--", *cited_rel_files],
+    ):
+        rc, out, _, _, _ = _run_command_isolated(diff_args, timeout_sec=5.0)
+        if rc == 0 and out.strip():
+            for line in out.splitlines():
+                clean = line.strip()
+                if clean:
+                    modified.add(clean)
+    return sorted(modified)
+
+
+def _compute_working_tree_hash(
+    repo_root: Optional[pathlib.Path],
+    fallback_map: Dict[str, str],
+    current_head_sha: Optional[str] = None,
+) -> str:
+    """
+    Computes a deterministic hash representing the current working tree state
+    using `git status --porcelain` + `git write-tree` (only when index has staged
+    changes or HEAD is absent) + dirty/untracked file hashes (excluding .ag_state,
+    __pycache__, .pytest_cache, logs) with deterministic fallback outside Git.
+    """
+    if repo_root is not None and (repo_root / ".git").exists():
+        git_bin = _resolve_git_binary()
+        rc_st, out_st, _, _, _ = _run_command_isolated(
+            [git_bin, "-C", str(repo_root), "-c", "core.quotepath=false", "status", "--porcelain=v1", "-uall"],
+            timeout_sec=5.0,
+        )
+        raw_lines = out_st.splitlines() if rc_st == 0 and out_st else []
+        has_staged = any(len(ln) >= 2 and ln[0] not in (" ", "?") for ln in raw_lines)
+
+        if has_staged or not current_head_sha:
+            rc_wt, out_wt, _, _, _ = _run_command_isolated(
+                [git_bin, "-C", str(repo_root), "write-tree"],
+                timeout_sec=5.0,
+            )
+            tree_tag = f"TREE:{out_wt.strip()}" if rc_wt == 0 and out_wt.strip() else "TREE:UNBORN_INDEX"
+        else:
+            tree_tag = f"HEAD:{current_head_sha}"
+
+        h = hashlib.sha256()
+        h.update(f"{tree_tag}\n".encode("utf-8"))
+        if raw_lines:
+            ignored_parts = {".ag_state", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+            dirty_entries: List[Tuple[str, str]] = []
+            for raw_line in raw_lines:
+                if len(raw_line) < 4:
+                    continue
+                status_code = raw_line[:2]
+                rel_raw = raw_line[3:]
+                if " -> " in rel_raw:
+                    rel_raw = rel_raw.split(" -> ", 1)[1]
+                if rel_raw.startswith('"') and rel_raw.endswith('"'):
+                    rel_raw = rel_raw[1:-1]
+                norm_rel = rel_raw.replace("\\", "/").lstrip("./")
+                parts = norm_rel.split("/")
+                if any(part in ignored_parts for part in parts) or norm_rel.startswith("logs/"):
+                    continue
+                dirty_entries.append((f"{status_code}:{norm_rel}", norm_rel))
+            dirty_entries.sort(key=lambda item: item[1])
+            for tag, norm_rel in dirty_entries:
+                fpath = repo_root / norm_rel
+                if fpath.is_file() and not _is_symlink_or_junction(fpath):
+                    fhash = _sha256_file(fpath, normalize_eol=True)
+                else:
+                    fhash = "DIR_OR_MISSING"
+                h.update(f"{tag}:{fhash}\n".encode("utf-8"))
+        return h.hexdigest()
+
+    h_fb = hashlib.sha256()
+    for k in sorted(fallback_map.keys()):
+        h_fb.update(f"{k}:{fallback_map[k]}\n".encode("utf-8"))
+    return h_fb.hexdigest()
+
+
+def _detect_oscillation_cycle(
+    recent_hashes: List[str],
+    current_hash: str,
+    allow_initial_same: bool = False,
+) -> Optional[int]:
+    """
+    Returns cycle length k >= 1 if current_hash repeats a previously seen state
+    within the bounded history window, or None if no oscillation cycle occurred.
+    """
+    if not recent_hashes:
+        return None
+    if allow_initial_same and len(recent_hashes) == 1 and recent_hashes[0] == current_hash:
+        return None
+    for dist, prev_hash in enumerate(reversed(recent_hashes), start=1):
+        if prev_hash == current_hash:
+            return dist
+    return None
+
+
+def _append_bounded_history(recent_hashes: List[str], new_hash: str, maxlen: int = 16) -> List[str]:
+    dq = collections.deque(recent_hashes, maxlen=maxlen)
+    if not dq or dq[-1] != new_hash:
+        dq.append(new_hash)
+    return list(dq)
+
+
 def _parse_guard_receipt(receipt_path: pathlib.Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Loads and validates core receipt fields for both v2.3 and v2.4 receipts."""
     try:
@@ -1112,11 +1272,29 @@ def _guard_witness_red(
     receipt_path: pathlib.Path,
     timeout_sec: float,
     cli_ignore: List[str],
+    repo_root: Optional[pathlib.Path],
     current_head_sha: Optional[str],
 ) -> int:
     cmd_str = (args.cmd or "").strip()
     if not cmd_str:
         return _emit({"ok": False, "error": "MISSING_CMD: --cmd is required for witness-red"}, args.json, exit_code=1)
+
+    base_ref = (getattr(args, "base_ref", None) or "").strip() or None
+    merge_base_sha: Optional[str] = None
+    if base_ref:
+        if repo_root is None or current_head_sha is None:
+            return _emit(
+                {"ok": False, "error": "INVALID_BASE_REF: --base-ref requires an initialized Git repository."},
+                args.json,
+                exit_code=1,
+            )
+        merge_base_sha = _git_merge_base(repo_root, base_ref, "HEAD")
+        if not merge_base_sha:
+            return _emit(
+                {"ok": False, "error": f"INVALID_BASE_REF: Unable to resolve merge-base between '{base_ref}' and HEAD."},
+                args.json,
+                exit_code=1,
+            )
 
     forbid_addopts = _parse_ignore_patterns(getattr(args, "forbid_addopts", None))
     allow_passthrough = bool(getattr(args, "allow_env_passthrough", False))
@@ -1219,6 +1397,7 @@ def _guard_witness_red(
     red_signature = _extract_red_signature(stdout_txt, stderr_txt)
     exec_counts = _extract_test_execution_counts(cmd_str, stdout_txt, stderr_txt)
     witnessed_test_count = exec_counts["total"] if exec_counts is not None else None
+    working_tree_hash = _compute_working_tree_hash(repo_root, files_map, current_head_sha=current_head_sha)
 
     receipt: Dict[str, Any] = {
         "version": 2,
@@ -1229,6 +1408,8 @@ def _guard_witness_red(
         "cmd": cmd_str,
         "tree_hash": tree_hash,
         "witnessed_head_sha": current_head_sha,
+        "base_ref": base_ref,
+        "merge_base_sha": merge_base_sha,
         "red_exit_code": returncode,
         "red_signature": red_signature,
         "witnessed_test_count": witnessed_test_count,
@@ -1238,6 +1419,8 @@ def _guard_witness_red(
         "env_policy": env_policy,
         "root_config_base": str(root_base),
         "root_config_manifest": root_manifest,
+        "recent_tree_hashes": [working_tree_hash],
+        "verify_attempts": 0,
         "files": files_map,
         "renegotiation_history": [],
         "collisions": [],
@@ -1251,6 +1434,8 @@ def _guard_witness_red(
             "status": "WITNESSED_RED",
             "tree_hash": tree_hash,
             "witnessed_head_sha": current_head_sha,
+            "base_ref": base_ref,
+            "merge_base_sha": merge_base_sha,
             "cmd": cmd_str,
             "red_exit_code": returncode,
             "red_signature": red_signature,
@@ -1271,6 +1456,7 @@ def _guard_verify_green(
     state_dir: pathlib.Path,
     receipt_path: pathlib.Path,
     timeout_sec: float,
+    repo_root: Optional[pathlib.Path],
     current_head_sha: Optional[str],
 ) -> int:
     if not receipt_path.is_file():
@@ -1299,23 +1485,34 @@ def _guard_verify_green(
         )
 
     saved_head_sha = saved_receipt.get("witnessed_head_sha")
-    if saved_head_sha and current_head_sha and saved_head_sha != current_head_sha and not getattr(args, "allow_head_move", False):
-        _record_guard_collision(
-            receipt_path,
-            saved_receipt,
-            "HEAD_MOVED_DURING_RED_PHASE",
-            {"witnessed_head_sha": saved_head_sha, "current_head_sha": current_head_sha},
-        )
-        return _emit(
-            {
-                "ok": False,
-                "error": f"HEAD_MOVED_DURING_RED_PHASE: Git HEAD moved from {saved_head_sha[:8]} to {current_head_sha[:8]} before verify-green. Local commits during Red->Green phase are prohibited unless --allow-head-move is set.",
-                "witnessed_head_sha": saved_head_sha,
-                "current_head_sha": current_head_sha,
-            },
-            args.json,
-            exit_code=2,
-        )
+    eff_base_ref = (getattr(args, "base_ref", None) or "").strip() or saved_receipt.get("base_ref")
+    if saved_head_sha and current_head_sha and saved_head_sha != current_head_sha:
+        if getattr(args, "allow_head_move", False):
+            _record_guard_collision(
+                receipt_path,
+                saved_receipt,
+                "HEAD_MOVE_ALLOWED",
+                {"witnessed_head_sha": saved_head_sha, "current_head_sha": current_head_sha},
+            )
+        elif eff_base_ref and repo_root is not None and _git_is_ancestor(repo_root, saved_head_sha, "HEAD"):
+            pass
+        else:
+            _record_guard_collision(
+                receipt_path,
+                saved_receipt,
+                "HEAD_MOVED_DURING_RED_PHASE",
+                {"witnessed_head_sha": saved_head_sha, "current_head_sha": current_head_sha},
+            )
+            return _emit(
+                {
+                    "ok": False,
+                    "error": f"HEAD_MOVED_DURING_RED_PHASE: Git HEAD moved from {saved_head_sha[:8]} to {current_head_sha[:8]} before verify-green. Local commits during Red->Green phase are prohibited unless --allow-head-move is set.",
+                    "witnessed_head_sha": saved_head_sha,
+                    "current_head_sha": current_head_sha,
+                },
+                args.json,
+                exit_code=2,
+            )
 
     saved_tree_hash = saved_receipt.get("tree_hash")
     saved_files: Dict[str, str] = saved_receipt.get("files", {})
@@ -1435,6 +1632,35 @@ def _guard_verify_green(
             args.json,
             exit_code=2,
         )
+
+    recent_hashes = list(saved_receipt.get("recent_tree_hashes", [])) if isinstance(saved_receipt.get("recent_tree_hashes"), list) else []
+    verify_attempts = int(saved_receipt.get("verify_attempts", 0) or 0)
+    working_tree_hash = _compute_working_tree_hash(repo_root, current_files, current_head_sha=current_head_sha)
+    cycle_len = _detect_oscillation_cycle(
+        recent_hashes,
+        working_tree_hash,
+        allow_initial_same=(verify_attempts == 0 and len(recent_hashes) == 1),
+    )
+    if cycle_len is not None:
+        _record_guard_collision(
+            receipt_path,
+            saved_receipt,
+            "OSCILLATION_CYCLE_DETECTED",
+            {"cycle_length": cycle_len, "repeated_hash": working_tree_hash[:16]},
+        )
+        return _emit(
+            {
+                "ok": False,
+                "error": f"OSCILLATION_CYCLE_DETECTED: Working tree reverted to a previously failed state (cycle_length={cycle_len}).",
+                "cycle_length": cycle_len,
+                "repeated_hash": working_tree_hash,
+            },
+            args.json,
+            exit_code=2,
+        )
+
+    saved_receipt["recent_tree_hashes"] = _append_bounded_history(recent_hashes, working_tree_hash, maxlen=16)
+    saved_receipt["verify_attempts"] = verify_attempts + 1
 
     returncode, stdout_txt, stderr_txt, timed_out, elapsed_ms = _run_command_isolated(cmd_to_run, timeout_sec, env=clean_env)
 
@@ -1597,6 +1823,8 @@ def _guard_renegotiate(
     inherited_forbid: List[str] = []
     renegotiated_at_iso = _utc_now_iso()
 
+    old_data: Optional[Dict[str, Any]] = None
+    recent_hashes: List[str] = []
     if receipt_path.is_file():
         old_data, parse_err = _parse_guard_receipt(receipt_path)
         if parse_err or old_data is None:
@@ -1634,6 +1862,7 @@ def _guard_renegotiate(
         collisions = list(old_data.get("collisions", [])) if isinstance(old_data.get("collisions"), list) else []
         inherited_ignore = list(old_data.get("ignored_patterns", []))
         inherited_forbid = list(old_data.get("forbidden_addopts", []))
+        recent_hashes = list(old_data.get("recent_tree_hashes", [])) if isinstance(old_data.get("recent_tree_hashes"), list) else []
         hist_entry: Dict[str, Any] = {
             "timestamp": old_data.get("timestamp_utc"),
             "renegotiated_at": renegotiated_at_iso,
@@ -1649,23 +1878,74 @@ def _guard_renegotiate(
             hist_entry["constructive_witness"] = old_data["constructive_witness"]
         history.append(hist_entry)
 
-        if old_head_sha and current_head_sha and old_head_sha != current_head_sha and not getattr(args, "allow_head_move", False):
-            _record_guard_collision(
-                receipt_path,
-                old_data,
-                "HEAD_MOVED_DURING_RED_PHASE",
-                {"witnessed_head_sha": old_head_sha, "current_head_sha": current_head_sha},
-            )
-            return _emit(
-                {
-                    "ok": False,
-                    "error": f"HEAD_MOVED_DURING_RED_PHASE: Git HEAD moved from {old_head_sha[:8]} to {current_head_sha[:8]} before renegotiate. Forging witness commits during Red phase is prohibited.",
+        eff_base_ref = (getattr(args, "base_ref", None) or "").strip() or old_data.get("base_ref")
+        if old_head_sha and current_head_sha and old_head_sha != current_head_sha:
+            if getattr(args, "allow_head_move", False):
+                collisions.append({
+                    "timestamp_utc": renegotiated_at_iso,
+                    "event": "HEAD_MOVE_ALLOWED",
                     "witnessed_head_sha": old_head_sha,
                     "current_head_sha": current_head_sha,
-                },
+                })
+            elif eff_base_ref and repo_root is not None and _git_is_ancestor(repo_root, old_head_sha, "HEAD"):
+                pass
+            else:
+                _record_guard_collision(
+                    receipt_path,
+                    old_data,
+                    "HEAD_MOVED_DURING_RED_PHASE",
+                    {"witnessed_head_sha": old_head_sha, "current_head_sha": current_head_sha},
+                )
+                return _emit(
+                    {
+                        "ok": False,
+                        "error": f"HEAD_MOVED_DURING_RED_PHASE: Git HEAD moved from {old_head_sha[:8]} to {current_head_sha[:8]} before renegotiate. Forging witness commits during Red phase is prohibited.",
+                        "witnessed_head_sha": old_head_sha,
+                        "current_head_sha": current_head_sha,
+                    },
+                    args.json,
+                    exit_code=2,
+                )
+    else:
+        eff_base_ref = (getattr(args, "base_ref", None) or "").strip() or None
+
+    merge_base_sha: Optional[str] = None
+    if eff_base_ref:
+        if repo_root is None or current_head_sha is None:
+            return _emit(
+                {"ok": False, "error": "INVALID_BASE_REF: --base-ref requires an initialized Git repository."},
                 args.json,
-                exit_code=2,
+                exit_code=1,
             )
+        merge_base_sha = _git_merge_base(repo_root, eff_base_ref, "HEAD")
+        if not merge_base_sha:
+            return _emit(
+                {"ok": False, "error": f"INVALID_BASE_REF: Unable to resolve merge-base between '{eff_base_ref}' and HEAD."},
+                args.json,
+                exit_code=1,
+            )
+        cited_spec_files = _extract_cited_spec_files(args, repo_root)
+        if cited_spec_files:
+            modified_specs = _check_specs_modified_since_base(repo_root, merge_base_sha, cited_spec_files)
+            if modified_specs:
+                if old_data is not None:
+                    _record_guard_collision(
+                        receipt_path,
+                        old_data,
+                        "SPEC_MODIFIED_SINCE_BASE",
+                        {"base_ref": eff_base_ref, "merge_base_sha": merge_base_sha, "modified_files": modified_specs},
+                    )
+                return _emit(
+                    {
+                        "ok": False,
+                        "error": f"SPEC_MODIFIED_SINCE_BASE: Cited specification file(s) modified since merge-base {merge_base_sha[:8]} ({eff_base_ref}): {', '.join(modified_specs)}",
+                        "base_ref": eff_base_ref,
+                        "merge_base_sha": merge_base_sha,
+                        "modified_files": modified_specs,
+                    },
+                    args.json,
+                    exit_code=2,
+                )
 
     effective_ignore = cli_ignore if cli_ignore else inherited_ignore
     cli_forbid = _parse_ignore_patterns(getattr(args, "forbid_addopts", None))
@@ -1804,6 +2084,27 @@ def _guard_renegotiate(
     red_signature = _extract_red_signature(stdout_txt, stderr_txt)
     exec_counts = _extract_test_execution_counts(cmd_str, stdout_txt, stderr_txt)
     witnessed_test_count = exec_counts["total"] if exec_counts is not None else None
+    working_tree_hash = _compute_working_tree_hash(repo_root, files_map, current_head_sha=current_head_sha)
+    cycle_len = _detect_oscillation_cycle(recent_hashes, working_tree_hash, allow_initial_same=True)
+    if cycle_len is not None and cycle_len >= 2:
+        if old_data is not None:
+            _record_guard_collision(
+                receipt_path,
+                old_data,
+                "OSCILLATION_CYCLE_DETECTED",
+                {"cycle_length": cycle_len, "repeated_hash": working_tree_hash[:16]},
+            )
+        return _emit(
+            {
+                "ok": False,
+                "error": f"OSCILLATION_CYCLE_DETECTED: Renegotiation reverted working tree to an earlier state (cycle_length={cycle_len}).",
+                "cycle_length": cycle_len,
+                "repeated_hash": working_tree_hash,
+            },
+            args.json,
+            exit_code=2,
+        )
+    updated_recent_hashes = _append_bounded_history(recent_hashes, working_tree_hash, maxlen=16)
 
     new_receipt: Dict[str, Any] = {
         "version": 2,
@@ -1816,6 +2117,8 @@ def _guard_renegotiate(
         "tree_hash": tree_hash,
         "previous_tree_hash": old_tree_hash,
         "witnessed_head_sha": pinned_sha_for_witness,
+        "base_ref": eff_base_ref,
+        "merge_base_sha": merge_base_sha,
         "red_exit_code": returncode,
         "red_signature": red_signature,
         "witnessed_test_count": witnessed_test_count,
@@ -1825,6 +2128,8 @@ def _guard_renegotiate(
         "env_policy": env_policy,
         "root_config_base": str(root_base),
         "root_config_manifest": root_manifest,
+        "recent_tree_hashes": updated_recent_hashes,
+        "verify_attempts": 0,
         "files": files_map,
         "renegotiation_history": history,
         "collisions": collisions,
@@ -1843,6 +2148,8 @@ def _guard_renegotiate(
             "new_tree_hash": tree_hash,
             "previous_tree_hash": old_tree_hash,
             "witnessed_head_sha": pinned_sha_for_witness,
+            "base_ref": eff_base_ref,
+            "merge_base_sha": merge_base_sha,
             "cmd": cmd_str,
             "red_exit_code": returncode,
             "red_signature": red_signature,
@@ -1856,9 +2163,110 @@ def _guard_renegotiate(
     )
 
 
+def _guard_check_scope(args: argparse.Namespace) -> int:
+    """
+    Mechanical scope separation (SCAR-PROC-13 / Cohort A):
+    Runs a single `git diff --name-only <base>...HEAD` and rejects mixed commits/PRs
+    that modify both governance/rule paths and production code simultaneously.
+    """
+    repo_arg = pathlib.Path(getattr(args, "repo", ".") or ".").resolve()
+    repo_root = _find_git_root_pure(repo_arg)
+    if repo_root is None:
+        return _emit(
+            {"ok": False, "error": f"NOT_A_GIT_REPO: No .git directory found for {repo_arg}"},
+            args.json,
+            exit_code=1,
+        )
+
+    base_ref = (getattr(args, "base", None) or "origin/main").strip()
+    raw_rule_paths = getattr(args, "rule_paths", "") or ""
+    rule_patterns = [
+        p.strip().replace("\\", "/").strip("/")
+        for p in raw_rule_paths.split(",")
+        if p.strip()
+    ]
+
+    git_bin = _resolve_git_binary()
+    rc, out, err, _, _ = _run_command_isolated(
+        [git_bin, "-C", str(repo_root), "-c", "core.quotepath=false", "diff", "--name-only", f"{base_ref}...HEAD"],
+        timeout_sec=10.0,
+    )
+    if rc != 0:
+        return _emit(
+            {
+                "ok": False,
+                "error": f"GIT_DIFF_FAILED: Failed to diff '{base_ref}...HEAD': {err.strip()}",
+                "base": base_ref,
+            },
+            args.json,
+            exit_code=1,
+        )
+
+    changed_files = [ln.strip().replace("\\", "/").lstrip("./") for ln in out.splitlines() if ln.strip()]
+    rule_files: List[str] = []
+    code_files: List[str] = []
+
+    for rel_path in changed_files:
+        is_rule = False
+        for pat in rule_patterns:
+            if rel_path == pat or rel_path.startswith(pat + "/") or fnmatch.fnmatch(rel_path, pat):
+                is_rule = True
+                break
+        if is_rule:
+            rule_files.append(rel_path)
+        else:
+            code_files.append(rel_path)
+
+    if rule_files and code_files:
+        return _emit(
+            {
+                "ok": False,
+                "error": "MIXED_SCOPE_VIOLATION: Changes mix governance/rule paths with production code in the same branch/PR.",
+                "base": base_ref,
+                "rule_paths": rule_patterns,
+                "rule_files": rule_files,
+                "code_files": code_files,
+            },
+            args.json,
+            exit_code=2,
+        )
+
+    if rule_files:
+        scope = "RULES_ONLY"
+    elif code_files:
+        scope = "CODE_ONLY"
+    else:
+        scope = "EMPTY"
+
+    return _emit(
+        {
+            "ok": True,
+            "scope": scope,
+            "base": base_ref,
+            "rule_paths": rule_patterns,
+            "rule_files": rule_files,
+            "code_files": code_files,
+            "changed_count": len(changed_files),
+        },
+        args.json,
+        exit_code=0,
+    )
+
+
 def _cmd_guard(args: argparse.Namespace) -> int:
     action = args.guard_action
-    raw_target = pathlib.Path(args.test_dir)
+    if action == "check-scope":
+        return _guard_check_scope(args)
+
+    raw_test_dir = getattr(args, "test_dir", None)
+    if not raw_test_dir:
+        return _emit(
+            {"ok": False, "error": f"MISSING_TEST_DIR: --test-dir is required for guard {action}"},
+            args.json,
+            exit_code=1,
+        )
+
+    raw_target = pathlib.Path(raw_test_dir)
     if _is_symlink_or_junction(raw_target):
         return _emit(
             {"ok": False, "error": f"GUARD_INIT_FAILED: Symlinks and junctions are forbidden in Merkle guard target: {raw_target}"},
@@ -1881,9 +2289,9 @@ def _cmd_guard(args: argparse.Namespace) -> int:
     repo_root, current_head_sha = _get_git_repo_and_head(test_path)
 
     if action == "witness-red":
-        return _guard_witness_red(args, test_path, state_dir, receipt_path, timeout_sec, cli_ignore, current_head_sha)
+        return _guard_witness_red(args, test_path, state_dir, receipt_path, timeout_sec, cli_ignore, repo_root, current_head_sha)
     if action == "verify-green":
-        return _guard_verify_green(args, test_path, state_dir, receipt_path, timeout_sec, current_head_sha)
+        return _guard_verify_green(args, test_path, state_dir, receipt_path, timeout_sec, repo_root, current_head_sha)
     if action == "renegotiate":
         return _guard_renegotiate(args, test_path, state_dir, receipt_path, timeout_sec, cli_ignore, repo_root, current_head_sha)
 
@@ -2057,6 +2465,52 @@ def _cmd_state(args: argparse.Namespace) -> int:
                 else:
                     artifacts_map[p.as_posix()] = "NOT_FOUND"
 
+        sealed_artifacts = {k: v for k, v in artifacts_map.items() if v != "NOT_FOUND"}
+        osc_path = state_dir / "oscillation_history.json"
+        osc_data: Optional[Dict[str, Any]] = None
+        if sealed_artifacts:
+            h_art = hashlib.sha256()
+            for k in sorted(sealed_artifacts.keys()):
+                h_art.update(f"{k}:{sealed_artifacts[k]}\n".encode("utf-8"))
+            art_state_hash = h_art.hexdigest()
+
+            prev_osc: Dict[str, Any] = {}
+            if osc_path.is_file():
+                try:
+                    loaded_osc = json.loads(osc_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded_osc, dict):
+                        prev_osc = loaded_osc
+                except (OSError, json.JSONDecodeError):
+                    prev_osc = {}
+            recent_art_hashes = list(prev_osc.get("recent_tree_hashes", [])) if isinstance(prev_osc.get("recent_tree_hashes"), list) else []
+            cycle_len = _detect_oscillation_cycle(recent_art_hashes, art_state_hash, allow_initial_same=False)
+            same_meta = (
+                prev_osc.get("last_step") == step_str
+                and prev_osc.get("last_name") == slug
+                and prev_osc.get("last_status") == status
+                and prev_osc.get("last_summary") == summary
+                and not getattr(args, "replace", False)
+            )
+            if cycle_len is not None and (cycle_len >= 2 or same_meta):
+                return _emit(
+                    {
+                        "ok": False,
+                        "error": f"OSCILLATION_CYCLE_DETECTED: State artifact set reverted to a previously recorded state (cycle_length={cycle_len}).",
+                        "cycle_length": cycle_len,
+                        "repeated_hash": art_state_hash,
+                    },
+                    args.json,
+                    exit_code=2,
+                )
+            osc_data = {
+                "version": _SCHEMA_VERSION,
+                "recent_tree_hashes": _append_bounded_history(recent_art_hashes, art_state_hash, maxlen=16),
+                "last_step": step_str,
+                "last_name": slug,
+                "last_status": status,
+                "last_summary": summary,
+            }
+
         record = {
             "step": step_str,
             "name": slug,
@@ -2073,6 +2527,8 @@ def _cmd_state(args: argparse.Namespace) -> int:
                 sys.stderr.write(f"[ag_ops] Warning: failed to unlink {existing}: {exc}\n")
 
         _atomic_write_json(target_file, record)
+        if osc_data is not None:
+            _atomic_write_json(osc_path, osc_data)
 
         return _emit(
             {
@@ -2182,6 +2638,15 @@ def _cmd_state(args: argparse.Namespace) -> int:
         }
         if late_sealed_notices:
             payload["late_sealed_notices"] = late_sealed_notices
+        osc_path = state_dir / "oscillation_history.json"
+        if osc_path.is_file():
+            try:
+                with open(osc_path, "r", encoding="utf-8") as of:
+                    osc_loaded = json.load(of)
+                if isinstance(osc_loaded, dict) and isinstance(osc_loaded.get("recent_tree_hashes"), list):
+                    payload["recent_tree_hashes"] = osc_loaded["recent_tree_hashes"]
+            except (OSError, json.JSONDecodeError):
+                pass
 
         return _emit(
             payload,
@@ -3386,8 +3851,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # 1. guard
     p_guard = subparsers.add_parser("guard", help="Merkle-locked test verification and contract enforcement.")
-    p_guard.add_argument("guard_action", choices=["witness-red", "verify-green", "renegotiate"])
-    p_guard.add_argument("--test-dir", required=True, help="Test file or directory to seal in Merkle tree.")
+    p_guard.add_argument("guard_action", choices=["witness-red", "verify-green", "renegotiate", "check-scope"])
+    p_guard.add_argument("--test-dir", default=None, help="Test file or directory to seal in Merkle tree.")
     p_guard.add_argument("--cmd", default="", help="Test execution command line.")
     p_guard.add_argument("--state-dir", default=None, help="Directory to store merkle_guard_<hash>.json (default: .ag_state).")
     p_guard.add_argument("--ignore", default="", help="Comma-separated glob/relative paths to exclude and record in receipt.")
@@ -3404,6 +3869,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_guard.add_argument("--fork-options", default="", help="Pipe-separated 'OptionA@file:line|OptionB@file:line' for arch-fork.")
     p_guard.add_argument("--expected-exit", type=int, default=None, help="Expected exit code for witness-red/renegotiate.")
     p_guard.add_argument("--allow-head-move", action="store_true", help="Allow Git HEAD to differ from witnessed_head_sha during verify-green/renegotiate.")
+    p_guard.add_argument("--base-ref", default=None, help="Anchor branch/ref for git merge-base ancestor and spec immutability checks.")
+    p_guard.add_argument("--base", default="origin/main", help="Base ref for guard check-scope diff comparison (default: origin/main).")
+    p_guard.add_argument("--rule-paths", default="", help="Comma-separated governance/spec paths for guard check-scope.")
+    p_guard.add_argument("--repo", default=".", help="Git repository path for guard check-scope (default: .).")
     p_guard.add_argument("--forbid-addopts", default="", help="Comma-separated addopts flags/patterns to forbid in pytest configs (e.g. '-p no:cov,-p no:assertion').")
     p_guard.add_argument("--allow-env-passthrough", action="store_true", help="Allow tainted environment variables (e.g. PYTEST_ADDOPTS) and record in receipt.")
     p_guard.add_argument("--timeout", type=float, default=120.0, help="Test execution timeout in seconds.")

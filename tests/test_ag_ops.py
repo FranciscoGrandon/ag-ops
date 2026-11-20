@@ -150,6 +150,7 @@ class TestAgOpsV21(unittest.TestCase):
         rc, out = run_cli(
             "distill",
             "--cmd", f'"{sys.executable}" "{script}"',
+            "--max-lines", "5",
             "--log-dir", str(self.root / "logs"),
         )
         self.assertEqual(rc, 2)
@@ -208,8 +209,16 @@ class TestAgOpsV21(unittest.TestCase):
         self.assertEqual(rc_st1, 2)
         self.assertEqual(out_st1["drift_warnings"][0]["issue"], "ARTIFACT_NEVER_EXISTED")
 
-        # Aparece por primera vez -> se sella automáticamente
+        # Aparece por primera vez -> en modo --strict rechaza LATE_ARTIFACT_UNSEALED_AT_WRITE; sin --strict autosella
         art.write_text("contenido v1", encoding="utf-8")
+        rc_late_strict, out_late_strict = run_cli("state", "status", "--dir", str(sdir), "--strict")
+        self.assertEqual(rc_late_strict, 2)
+        self.assertEqual(out_late_strict["drift_warnings"][0]["issue"], "LATE_ARTIFACT_UNSEALED_AT_WRITE")
+
+        rc_st2_seal, out_st2_seal = run_cli("state", "status", "--dir", str(sdir))
+        self.assertEqual(rc_st2_seal, 0)
+        self.assertEqual(out_st2_seal["late_sealed_notices"][0]["issue"], "LATE_ARTIFACT_SEALED")
+
         rc_st2, out_st2 = run_cli("state", "status", "--dir", str(sdir), "--strict")
         self.assertEqual(rc_st2, 0)
         self.assertFalse(out_st2["has_drift"])
@@ -327,6 +336,152 @@ class TestAgOpsV21(unittest.TestCase):
         self.assertEqual(pair["file"], "calc.py")
         self.assertEqual(pair["overlapping_functions"], ["calc"])
         self.assertEqual(pair["asymmetry_signals"], ["FIX_VERB_INTENT"])
+
+    @unittest.skipUnless(
+        shutil.which("git") is not None or os.path.isfile(r"D:\GIT\MinGit-2.56.0.4-64-bit\cmd\git.exe"),
+        "Git no disponible",
+    )
+    def test_07_oscillation_2_cycle_detected(self):
+        git_bin = shutil.which("git") or r"D:\GIT\MinGit-2.56.0.4-64-bit\cmd\git.exe"
+        repo = self.root / "repo_osc"
+        repo.mkdir()
+
+        def git(*args: str):
+            subprocess.run([git_bin, *args], cwd=repo, check=True, capture_output=True, text=True)
+
+        git("init")
+        git("config", "user.email", "test@example.com")
+        git("config", "user.name", "Tester")
+
+        app = repo / "app.py"
+        app.write_text("def val(): return 1\n", encoding="utf-8")
+        tdir = repo / "tests"
+        tdir.mkdir()
+        (tdir / "test_app.py").write_text(
+            f"import sys\nsys.path.insert(0, {repo.as_posix()!r})\nimport app\ndef test_v(): assert app.val() == 42\n",
+            encoding="utf-8",
+        )
+        git("add", "-A")
+        git("commit", "-m", "init state A")
+
+        cmd = f'"{sys.executable}" -m pytest "{tdir.as_posix()}"'
+        rc_red, _ = run_cli("guard", "witness-red", "--test-dir", str(tdir), "--cmd", cmd, cwd=repo)
+        self.assertEqual(rc_red, 0)
+
+        # Estado B (falla distinto) -> verify-green falla con exit 1 (TEST_STILL_FAILING)
+        app.write_text("def val(): return 2\n", encoding="utf-8")
+        rc_b, out_b = run_cli("guard", "verify-green", "--test-dir", str(tdir), cwd=repo)
+        self.assertEqual(rc_b, 1)
+        self.assertIn("TEST_STILL_FAILING", out_b["error"])
+
+        # Reversión a Estado A -> detecta 2-ciclo A -> B -> A con exit 2
+        app.write_text("def val(): return 1\n", encoding="utf-8")
+        rc_cyc, out_cyc = run_cli("guard", "verify-green", "--test-dir", str(tdir), cwd=repo)
+        self.assertEqual(rc_cyc, 2)
+        self.assertIn("OSCILLATION_CYCLE_DETECTED", out_cyc["error"])
+        self.assertEqual(out_cyc["cycle_length"], 2)
+
+    @unittest.skipUnless(
+        shutil.which("git") is not None or os.path.isfile(r"D:\GIT\MinGit-2.56.0.4-64-bit\cmd\git.exe"),
+        "Git no disponible",
+    )
+    def test_08_base_ref_spec_modified_since_base(self):
+        git_bin = shutil.which("git") or r"D:\GIT\MinGit-2.56.0.4-64-bit\cmd\git.exe"
+        repo = self.root / "repo_baseref"
+        repo.mkdir()
+
+        def git(*args: str):
+            subprocess.run([git_bin, *args], cwd=repo, check=True, capture_output=True, text=True)
+
+        git("init")
+        git("config", "user.email", "test@example.com")
+        git("config", "user.name", "Tester")
+
+        spec = repo / "docs_spec.py"
+        spec.write_text("RULE_A = 10\nRULE_B = 20\n", encoding="utf-8")
+        tdir = repo / "tests"
+        tdir.mkdir()
+        (tdir / "test_rule.py").write_text("def test_fail(): assert False\n", encoding="utf-8")
+        git("add", "-A")
+        git("commit", "-m", "base commit")
+        git("branch", "-M", "main")
+        git("checkout", "-b", "feature/agent-work")
+
+        # Agente edita la especificación antes de pedir renegotiate
+        spec.write_text("RULE_A = 10\nRULE_B = 10\n", encoding="utf-8")
+        git("add", "docs_spec.py")
+        git("commit", "-m", "chore: weaken RULE_B in spec")
+
+        cmd = f'"{sys.executable}" -m pytest "{tdir.as_posix()}"'
+        rc_red, _ = run_cli("guard", "witness-red", "--test-dir", str(tdir), "--cmd", cmd, "--base-ref", "main", cwd=repo)
+        self.assertEqual(rc_red, 0)
+
+        rc_ren, out_ren = run_cli(
+            "guard", "renegotiate",
+            "--test-dir", str(tdir),
+            "--reason", "Specs collide",
+            "--require-witness",
+            "--witness-type", "spec-collision",
+            "--conflict-a", f"{spec}:1",
+            "--conflict-b", f"{spec}:2",
+            "--base-ref", "main",
+            cwd=repo,
+        )
+        self.assertEqual(rc_ren, 2)
+        self.assertIn("SPEC_MODIFIED_SINCE_BASE", out_ren["error"])
+        self.assertIn("docs_spec.py", out_ren["modified_files"])
+
+    @unittest.skipUnless(
+        shutil.which("git") is not None or os.path.isfile(r"D:\GIT\MinGit-2.56.0.4-64-bit\cmd\git.exe"),
+        "Git no disponible",
+    )
+    def test_09_guard_check_scope_mixed_violation(self):
+        git_bin = shutil.which("git") or r"D:\GIT\MinGit-2.56.0.4-64-bit\cmd\git.exe"
+        repo = self.root / "repo_scope"
+        repo.mkdir()
+
+        def git(*args: str):
+            subprocess.run([git_bin, *args], cwd=repo, check=True, capture_output=True, text=True)
+
+        git("init")
+        git("config", "user.email", "test@example.com")
+        git("config", "user.name", "Tester")
+
+        (repo / "docs").mkdir()
+        (repo / "docs" / "spec.md").write_text("v1\n", encoding="utf-8")
+        (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+        git("add", "-A")
+        git("commit", "-m", "base")
+        git("branch", "-M", "main")
+        git("checkout", "-b", "feature/mixed")
+
+        # Solo código -> CODE_ONLY (exit 0)
+        (repo / "app.py").write_text("x = 2\n", encoding="utf-8")
+        git("add", "app.py")
+        git("commit", "-m", "feat: update app")
+        rc_code, out_code = run_cli(
+            "guard", "check-scope",
+            "--repo", str(repo),
+            "--base", "main",
+            "--rule-paths", "docs,ag_ops.py",
+        )
+        self.assertEqual(rc_code, 0)
+        self.assertEqual(out_code["scope"], "CODE_ONLY")
+
+        # Mezcla con regla/spec -> MIXED_SCOPE_VIOLATION (exit 2)
+        (repo / "docs" / "spec.md").write_text("v2\n", encoding="utf-8")
+        git("add", "docs/spec.md")
+        git("commit", "-m", "docs: alter spec in same PR")
+        rc_mix, out_mix = run_cli(
+            "guard", "check-scope",
+            "--repo", str(repo),
+            "--base", "main",
+            "--rule-paths", "docs,ag_ops.py",
+        )
+        self.assertEqual(rc_mix, 2)
+        self.assertIn("MIXED_SCOPE_VIOLATION", out_mix["error"])
+        self.assertEqual(out_mix["rule_files"], ["docs/spec.md"])
+        self.assertEqual(out_mix["code_files"], ["app.py"])
 
 
 if __name__ == "__main__":
