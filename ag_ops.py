@@ -883,7 +883,9 @@ def _extract_addopts_tokens(cfg_path: pathlib.Path) -> Tuple[List[str], Optional
             data = tomllib.loads(raw_text)
         except Exception as exc:
             return [], f"Invalid TOML in {cfg_path.name}: {exc}"
-        ini_opts = data.get("tool", {}).get("pytest", {}).get("ini_options", {})
+        tool_sec = data.get("tool")
+        pytest_sec = tool_sec.get("pytest") if isinstance(tool_sec, dict) else None
+        ini_opts = pytest_sec.get("ini_options") if isinstance(pytest_sec, dict) else None
         if not isinstance(ini_opts, dict):
             return [], None
         raw_addopts = ini_opts.get("addopts")
@@ -2333,6 +2335,7 @@ def _guard_renegotiate_batch(args: argparse.Namespace) -> int:
 
     renegotiated_at_iso = _utc_now_iso()
     staged_items: List[Dict[str, Any]] = []
+    seen_receipts: Set[pathlib.Path] = set()
     combined_stdout: List[str] = []
     combined_stderr: List[str] = []
     primary_repo_root: Optional[pathlib.Path] = None
@@ -2367,6 +2370,13 @@ def _guard_renegotiate_batch(args: argparse.Namespace) -> int:
         state_dir = _resolve_state_dir(test_path, pathlib.Path(str(raw_sdir)) if raw_sdir else None)
         state_dir.mkdir(parents=True, exist_ok=True)
         receipt_path = _receipt_path_for_target(state_dir, test_path)
+        if receipt_path in seen_receipts:
+            return _emit(
+                {"ok": False, "error": f"DUPLICATE_BATCH_TARGET: Target resolves to duplicate receipt: {test_path}"},
+                args.json,
+                exit_code=1,
+            )
+        seen_receipts.add(receipt_path)
         repo_root, current_head_sha = _get_git_repo_and_head(test_path)
 
         history: List[Dict[str, Any]] = []

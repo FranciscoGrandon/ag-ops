@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Dependencies](https://img.shields.io/badge/dependencies-zero%20(stdlib)-brightgreen.svg)](#)
 [![Deterministic](https://img.shields.io/badge/architecture-100%25%20deterministic-purple.svg)](#)
-[![Tests Status](https://img.shields.io/badge/tests-70%2F70%20pytest%20%2B%2011%2F11%20unittest-success.svg)](#)
+[![Tests Status](https://img.shields.io/badge/tests-71%2F71%20pytest%20%2B%2011%2F11%20unittest-success.svg)](#)
 [![Adversarial Benchmark](https://img.shields.io/badge/adversarial%20benchmark-31%2F36%20contained%20(86.11%25)-blueviolet.svg)](#)
 
 ---
@@ -161,7 +161,7 @@ Para evitar sobrepromesas de seguridad dentro del mismo usuario/shell del agente
 * Consultar el [Modelo de Amenazas Formal (`THREAT_MODEL.md`)](THREAT_MODEL.md).
 * Consultar la [Especificación de Autoridad Fuera del Agente (`docs/ARCHITECTURE_V2_2_AUTHORITY.md`)](docs/ARCHITECTURE_V2_2_AUTHORITY.md).
 
-### 3.2 Resultados de la Suite de Pruebas Automatizadas (`70` pytest + `11` unittest)
+### 3.2 Resultados de la Suite de Pruebas Automatizadas (`71` pytest + `11` unittest)
 La arquitectura física de `ag_ops.py` v2.4 está respaldada por suites automatizadas de regresión, cobertura, compatibilidad v2.x, pruebas Git temporales y sensores P0–P3.
 
 ```powershell
@@ -176,7 +176,7 @@ tests/test_ag_ops_qa_coverage.py  (25 passed)  — cobertura unitaria e integrac
 tests/test_ag_ops_v2.py           (6 passed)   — regresión v2.0
 tests/test_ag_ops_v2_1.py         (6 passed)   — regresión v2.1
 tests/test_ag_ops_v2_2.py         (6 passed)   — regresión v2.2
-tests/test_ag_ops_v2_4.py         (18 passed)  — cero dependencias + P0, P1, P2 y P3
+tests/test_ag_ops_v2_4.py         (19 passed)  — cero dependencias + P0, P1, P2 y P3 + edge cases
 test_ag_ops_v2.py (unittest)      (11 OK)      — suite raíz de auditoría
 ```
 

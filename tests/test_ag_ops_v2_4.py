@@ -734,3 +734,66 @@ def test_p3_mut001_detects_all_constructs_and_auditable_justifications(tmp_path:
     assert res_strict["warnings_count"] == 0
     assert res_strict["violations_count"] == 8
     assert all(v["rule"] == "MUT001" for v in res_strict["violations"])
+
+
+def test_pass1_edge_cases_setup_cfg_async_mut_scope_batch_state(tmp_path: pathlib.Path) -> None:
+    # 1. setup.cfg [tool:pytest] attached -kfoo blocking
+    proj = tmp_path / "cfg_edge"
+    tests_dir = _write_red_project(proj, failing=True)
+    cmd = f'"{sys.executable}" -m pytest'
+    (proj / "setup.cfg").write_text("[tool:pytest]\naddopts = -kfoo\n", encoding="utf-8")
+    rc_k, res_k = _run_cli(["guard", "witness-red", "--test-dir", str(tests_dir), "--cmd", cmd, "--json"], cwd=proj)
+    assert rc_k == 2, res_k
+    assert "UNSAFE_PYTEST_ADDOPTS" in res_k["error"]
+
+    # 2. guard check-scope error branches (non-git dir and invalid base ref)
+    rc_ng, res_ng = _run_cli(["guard", "check-scope", "--repo", str(proj), "--base", "main", "--rule-paths", ".gemini", "--json"])
+    assert rc_ng == 1 and "NOT_A_GIT_REPO" in res_ng["error"]
+
+    repo = tmp_path / "repo_edge"
+    _init_git_repo(repo)
+    rc_ib, res_ib = _run_cli(["guard", "check-scope", "--repo", str(repo), "--base", "nonexistent-branch", "--rule-paths", ".gemini", "--json"])
+    assert rc_ib == 1 and "GIT_DIFF_FAILED" in res_ib["error"]
+
+    # 3. guard renegotiate --batch rejects duplicate targets resolving to same receipt
+    p1 = _write_red_project(repo / "svc", failing=True)
+    dup_manifest = repo / "dup_batch.json"
+    dup_manifest.write_text(
+        json.dumps([
+            {"test_dir": str(p1), "cmd": cmd},
+            {"test_dir": "svc/tests", "cmd": cmd},
+        ]),
+        encoding="utf-8",
+    )
+    rc_dup, res_dup = _run_cli(
+        ["guard", "renegotiate", "--batch", str(dup_manifest), "--reason", "Duplicate target test", "--json"],
+        cwd=repo,
+    )
+    assert rc_dup == 1 and "DUPLICATE_BATCH_TARGET" in res_dup["error"]
+
+    # 4. MUT001 detects async def get_* and nested return self.items.pop()
+    async_mod = tmp_path / "async_mut.py"
+    async_mod.write_text(
+        "# Creado por Francisco Grandón Vergara\n"
+        "class AsyncRepo:\n"
+        "    def __init__(self) -> None:\n"
+        "        self.items = [1]\n"
+        "    async def get_next_item(self):\n"
+        "        return self.items.pop()\n",
+        encoding="utf-8",
+    )
+    rc_am, res_am = _run_cli(["ast-lint", str(async_mod), "--author", "Francisco Grandón Vergara", "--strict", "--json"])
+    assert rc_am == 1 and res_am["violations_count"] == 1
+    assert res_am["violations"][0]["function"] == "get_next_item"
+
+    # 5. state status --strict ignores oscillation_history.json & stat_cache.json without false corruption warnings
+    sdir = tmp_path / "state_clean"
+    art = tmp_path / "out.txt"
+    art.write_text("ok\n", encoding="utf-8")
+    assert _run_cli(["state", "write", "--dir", str(sdir), "--step", "10", "--name", "build", "--status", "COMPLETADO", "--artifacts", str(art), "--json"], cwd=tmp_path)[0] == 0
+    (sdir / "stat_cache.json").write_text('{"entries":{}}', encoding="utf-8")
+    rc_ss, res_ss = _run_cli(["state", "status", "--dir", str(sdir), "--strict", "--json"], cwd=tmp_path)
+    assert rc_ss == 0, res_ss
+    assert res_ss["has_drift"] is False
+    assert res_ss["runlevels_count"] == 1
+

@@ -25,15 +25,16 @@ Creado por Francisco Grandón Vergara
   - Detector determinista de oscilaciones `k`-ciclo (`recent_tree_hashes` acotado a 16 estados con `collections.deque(maxlen=16)`) en `guard` (`merkle_guard_<hash>.json`) y `state` (`.ag_state/oscillation_history.json`), deteniendo ciclos ping-pong `k >= 1` con `OSCILLATION_CYCLE_DETECTED` (exit `2`).
   - Nuevo subcomando `guard check-scope --base <ref> --rule-paths <rutas> [--repo <dir>] --json` que evalúa `git diff --name-only <base>...HEAD` e impide mezclar reglas/especificaciones con código productivo (`MIXED_SCOPE_VIOLATION`, exit `2`).
 - **Ergonomía y Sensor AST P3**:
-  - Renegociación agrupada atómica `guard renegotiate --batch <manifiesto.json>` bajo un único testigo constructivo `SCAR-PROC-150` compartido (`batch_id`), con rollback completo (cero recibos escritos) ante cualquier objetivo en verde o testigo inválido (sin `--force`).
+  - Renegociación agrupada atómica `guard renegotiate --batch <manifiesto.json>` bajo un único testigo constructivo `SCAR-PROC-150` compartido (`batch_id`), con rechazo a objetivos duplicados (`DUPLICATE_BATCH_TARGET`) y rollback completo (cero recibos escritos) ante cualquier objetivo en verde o testigo inválido (sin `--force`).
   - Regla AST `MUT001` integrada en `SinglePassVisitor` para detectar mutaciones ocultas en métodos de consulta (`get_*`, `is_*`, `has_*`, `validate_*`: `self.<attr> =`, `AugAssign`, `AnnAssign`, `del`, `global`, `.append/.extend/.pop/.clear/.update` sin descender a ámbitos anidados); advertencia no bloqueante por defecto, bloqueante con `--strict` y supresión explícita auditable `# ag_ops: allow-mutation: <razón>`.
-- **Suite v2.4**: Nueva batería `tests/test_ag_ops_v2_4.py` (18 pruebas cubriendo cero dependencias externas y fases P0–P3).
+- **Suite v2.4**: Nueva batería `tests/test_ag_ops_v2_4.py` (19 pruebas cubriendo cero dependencias externas y fases P0–P3).
 
 ### Cambiado
 - Construcción de subparsers enfocada por subcomando en `build_parser(only_subcommand=...)`, guarda previa a `stream.reconfigure` si stdout/stderr ya están en UTF-8 y captura de `oscillation_history.json` dentro del mismo `os.scandir` en `state status`, reduciendo la latencia de arranque y estado por debajo de v2.3 en todas las métricas medidas.
 
 ### Corregido
 - **Normalización de carpetas con punto inicial (`.gemini/`, `.ag_state/`)**: Reemplazo de `.lstrip("./")` por `_normalize_repo_relpath()` en `_compute_working_tree_hash` y `_guard_check_scope` para no truncar el punto inicial de rutas como `.gemini/rules/policy.md`.
+- **Resiliencia en parsing TOML**: Validación de tipos dict en tablas `[tool]` y `[tool.pytest]` de `pyproject.toml` antes de leer `ini_options.addopts`.
 
 ### Seguridad
 - Elevación de contención en *Manipulación de Pruebas* de `5/6` (`83.3 %`) en v2.3 a `12/12` (`100.0 %`) en el benchmark adversarial extendido (contención global `31/36` = `86.11 %`), documentando las fronteras remanentes en `THREAT_MODEL.md`.
