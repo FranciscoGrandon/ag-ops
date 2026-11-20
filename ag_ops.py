@@ -27,7 +27,7 @@ import subprocess  # nosec B404
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
 try:
     import tomllib
@@ -40,6 +40,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 _MAX_IN_MEMORY_EOL_BYTES = 10 * 1024 * 1024  # 10 MB threshold for CRLF->LF normalization
 _BINARY_SNIFF_BYTES = 8192
+_FILE_DIGEST = getattr(hashlib, "file_digest", None)
 
 
 def _utc_now_iso() -> str:
@@ -72,28 +73,58 @@ def _atomic_write_json(path: pathlib.Path, data: Dict[str, Any]) -> None:
         raise
 
 
-def _sha256_file(path: pathlib.Path, normalize_eol: bool = False) -> str:
+def _sha256_file(path: Union[pathlib.Path, str], normalize_eol: bool = False) -> str:
     """
-    Computes SHA-256 of a file. When normalize_eol=True, inspects the first 8 KB
-    for NUL bytes and checks file size (< 10 MB) before normalizing CRLF -> LF,
-    streaming larger or binary files safely in 64 KB chunks without RAM spikes.
+    Computes SHA-256 of a file using native C hashlib.file_digest when possible.
+    When normalize_eol=True, inspects the first 8 KB for NUL bytes: binary files
+    rewind and hash via file_digest; text files stream in 64 KB chunks normalizing
+    CRLF -> LF across chunk boundaries only when b"\\r" is present.
     """
-    h = hashlib.sha256()
+    file_digest = _FILE_DIGEST
     with open(path, "rb") as f:
-        if normalize_eol:
-            try:
-                file_size = os.fstat(f.fileno()).st_size
-            except OSError:
-                file_size = 0
-            first_chunk = f.read(_BINARY_SNIFF_BYTES)
-            if b"\x00" not in first_chunk and file_size <= _MAX_IN_MEMORY_EOL_BYTES:
-                content = first_chunk + f.read()
-                h.update(content.replace(b"\r\n", b"\n"))
-                return h.hexdigest()
-            h.update(first_chunk)
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+        if not normalize_eol:
+            if file_digest is not None:
+                return str(file_digest(f, "sha256").hexdigest())
+            h_raw = hashlib.sha256()
+            for chunk in iter(lambda: f.read(65536), b""):
+                h_raw.update(chunk)
+            return h_raw.hexdigest()
+
+        first_chunk = f.read(_BINARY_SNIFF_BYTES)
+        if b"\x00" in first_chunk:
+            f.seek(0)
+            if file_digest is not None:
+                return str(file_digest(f, "sha256").hexdigest())
+            h_bin = hashlib.sha256()
+            for chunk in iter(lambda: f.read(65536), b""):
+                h_bin.update(chunk)
+            return h_bin.hexdigest()
+
+        if len(first_chunk) < _BINARY_SNIFF_BYTES and b"\r" not in first_chunk:
+            return hashlib.sha256(first_chunk).hexdigest()
+
+        h = hashlib.sha256()
+        carry_cr = False
+        chunk = first_chunk
+        while chunk:
+            if carry_cr:
+                if chunk.startswith(b"\n"):
+                    h.update(b"\n")
+                    chunk = chunk[1:]
+                else:
+                    h.update(b"\r")
+                carry_cr = False
+            if chunk.endswith(b"\r"):
+                carry_cr = True
+                chunk = chunk[:-1]
+            if b"\r" in chunk:
+                chunk = chunk.replace(b"\r\n", b"\n")
+            if chunk:
+                h.update(chunk)
+            chunk = f.read(65536)
+        if carry_cr:
+            h.update(b"\r")
+        return h.hexdigest()
 
 
 def _is_symlink_or_junction(p: pathlib.Path) -> bool:
@@ -182,20 +213,137 @@ def _run_command_isolated(
     return returncode, stdout_txt or "", stderr_txt or "", timed_out, elapsed_ms
 
 
+class GitBatchReader:
+    """Persistent `git cat-file --batch` reader reducing K git-show spawns to 1 process."""
+
+    def __init__(self, repo_root: pathlib.Path) -> None:
+        self.repo_root = repo_root.resolve()
+        self._proc: Optional[subprocess.Popen[bytes]] = None
+        self._cache: Dict[str, Optional[bytes]] = {}
+
+    def __enter__(self) -> "GitBatchReader":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.close()
+
+    def _ensure_proc(self) -> subprocess.Popen[bytes]:
+        if self._proc is None or self._proc.poll() is not None:
+            git_bin = _resolve_git_binary()
+            kwargs: Dict[str, Any] = {
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.DEVNULL,
+            }
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            self._proc = subprocess.Popen(  # nosec B603
+                [git_bin, "-C", str(self.repo_root), "-c", "core.quotepath=false", "cat-file", "--batch"],
+                **kwargs,
+            )
+        return self._proc
+
+    @staticmethod
+    def _read_exact(stream: Any, size: int) -> bytes:
+        chunks: List[bytes] = []
+        remaining = size
+        while remaining > 0:
+            part = stream.read(remaining)
+            if not part:
+                break
+            chunks.append(part)
+            remaining -= len(part)
+        return b"".join(chunks)
+
+    def read_object_bytes(self, spec: str) -> Optional[bytes]:
+        if spec in self._cache:
+            return self._cache[spec]
+        if "\n" in spec or "\r" in spec:
+            return None
+        proc = self._ensure_proc()
+        if proc.stdin is None or proc.stdout is None:
+            return None
+        try:
+            proc.stdin.write((spec + "\n").encode("utf-8"))
+            proc.stdin.flush()
+            header_raw = proc.stdout.readline()
+            if not header_raw:
+                self.close()
+                return None
+            header = header_raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            if header.endswith(" missing") or header.endswith(" ambiguous"):
+                self._cache[spec] = None
+                return None
+            parts = header.rsplit(" ", 2)
+            if len(parts) != 3:
+                self._cache[spec] = None
+                return None
+            _, obj_type, size_str = parts
+            size = int(size_str)
+            data = self._read_exact(proc.stdout, size)
+            proc.stdout.read(1)
+            if obj_type != "blob":
+                self._cache[spec] = None
+                return None
+            self._cache[spec] = data
+            return data
+        except (OSError, ValueError):
+            self.close()
+            return None
+
+    def read_text(self, sha: str, rel_path: str) -> Optional[str]:
+        raw = self.read_object_bytes(f"{sha}:{rel_path}")
+        if raw is None:
+            return None
+        return raw.decode("utf-8", errors="replace")
+
+    def close(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            if proc.stdout is not None:
+                proc.stdout.close()
+        except OSError:
+            pass
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
+def _find_git_root_pure(start_path: pathlib.Path) -> Optional[pathlib.Path]:
+    """Finds enclosing Git root purely via filesystem walk without spawning git."""
+    cur = start_path.resolve()
+    if cur.is_file():
+        cur = cur.parent
+    for candidate in (cur, *cur.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
 def _get_git_repo_and_head(target_path: pathlib.Path) -> Tuple[Optional[pathlib.Path], Optional[str]]:
     """
     Resolves the enclosing Git repository root and current HEAD commit SHA for target_path.
+    Uses a pure filesystem walk first to avoid spawning git outside repositories.
     Returns (None, None) if not inside a Git repository or if HEAD is unborn.
     """
-    search_dir = target_path if target_path.is_dir() else target_path.parent
-    git_bin = _resolve_git_binary()
-    rc_top, out_top, _, _, _ = _run_command_isolated(
-        [git_bin, "-C", str(search_dir), "rev-parse", "--show-toplevel"],
-        timeout_sec=5.0,
-    )
-    if rc_top != 0 or not out_top.strip():
+    repo_root = _find_git_root_pure(target_path)
+    if repo_root is None:
         return None, None
-    repo_root = pathlib.Path(out_top.strip()).resolve()
+    git_bin = _resolve_git_binary()
     rc_head, out_head, _, _, _ = _run_command_isolated(
         [git_bin, "-C", str(repo_root), "rev-parse", "--verify", "HEAD"],
         timeout_sec=5.0,
@@ -389,12 +537,14 @@ def _validate_file_line_ref(
     ref: str,
     repo_root: Optional[pathlib.Path] = None,
     pinned_sha: Optional[str] = None,
+    git_reader: Optional[GitBatchReader] = None,
 ) -> Tuple[bool, str, str]:
     """
     Validates 'path/to/file.py:42' exists, is non-empty, line is within bounds,
     and the cited line is non-trivial (not blank or a pure comment).
     When repo_root and pinned_sha are available, reads file contents directly from
-    `git show <pinned_sha>:<rel_path>` to prevent working-tree forgery.
+    Git object storage (via GitBatchReader or `git show <pinned_sha>:<rel_path>`)
+    to prevent working-tree forgery.
     Returns (ok, canonical_ref_or_error, cited_line_excerpt).
     """
     if ":" not in ref:
@@ -414,12 +564,16 @@ def _validate_file_line_ref(
     if repo_root is not None and pinned_sha:
         try:
             rel_git_path = fpath.relative_to(repo_root).as_posix()
-            git_bin = _resolve_git_binary()
-            rc, out_txt, _, _, _ = _run_command_isolated(
-                [git_bin, "-C", str(repo_root), "-c", "core.quotepath=false", "show", f"{pinned_sha}:{rel_git_path}"],
-                timeout_sec=5.0,
-            )
-            if rc == 0:
+            if git_reader is not None:
+                out_txt = git_reader.read_text(pinned_sha, rel_git_path)
+                rc = 0 if out_txt is not None else 1
+            else:
+                git_bin = _resolve_git_binary()
+                rc, out_txt, _, _, _ = _run_command_isolated(
+                    [git_bin, "-C", str(repo_root), "-c", "core.quotepath=false", "show", f"{pinned_sha}:{rel_git_path}"],
+                    timeout_sec=5.0,
+                )
+            if rc == 0 and out_txt is not None:
                 content_text = out_txt
             elif not fpath.is_file():
                 return (
@@ -465,6 +619,7 @@ def _verify_constructive_witness(
     stderr_txt: str,
     repo_root: Optional[pathlib.Path] = None,
     pinned_sha: Optional[str] = None,
+    git_reader: Optional[GitBatchReader] = None,
 ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
     """
     Enforces SCAR-PROC-150 Constructive Witness Receipt when --witness-type or
@@ -486,8 +641,8 @@ def _verify_constructive_witness(
     if wtype == "spec-collision":
         ref_a = (getattr(args, "conflict_a", "") or "").strip()
         ref_b = (getattr(args, "conflict_b", "") or "").strip()
-        ok_a, msg_a, excerpt_a = _validate_file_line_ref(ref_a, repo_root, pinned_sha)
-        ok_b, msg_b, excerpt_b = _validate_file_line_ref(ref_b, repo_root, pinned_sha)
+        ok_a, msg_a, excerpt_a = _validate_file_line_ref(ref_a, repo_root, pinned_sha, git_reader=git_reader)
+        ok_b, msg_b, excerpt_b = _validate_file_line_ref(ref_b, repo_root, pinned_sha, git_reader=git_reader)
         if not (ok_a and ok_b):
             return False, f"INVALID_SPEC_COLLISION_PROOF: {msg_a if not ok_a else msg_b}", None
         if msg_a == msg_b:
@@ -533,7 +688,7 @@ def _verify_constructive_witness(
             clean_label = label.strip()
             if not clean_label:
                 return False, f"INVALID_ARCH_FORK_PROOF: Option '{opt}' must have a non-empty option label before '@'.", None
-            ok_ref, msg_ref, excerpt_ref = _validate_file_line_ref(ref.strip(), repo_root, pinned_sha)
+            ok_ref, msg_ref, excerpt_ref = _validate_file_line_ref(ref.strip(), repo_root, pinned_sha, git_reader=git_reader)
             if not ok_ref:
                 return False, f"INVALID_ARCH_FORK_PROOF: {msg_ref}", None
             if clean_label in seen_labels:
@@ -561,17 +716,6 @@ def _record_guard_collision(receipt_path: pathlib.Path, receipt_data: Dict[str, 
         _atomic_write_json(receipt_path, receipt_data)
     except OSError as exc:
         sys.stderr.write(f"[ag_ops] Warning: could not persist collision log to {receipt_path}: {exc}\n")
-
-
-def _find_git_root_pure(start_path: pathlib.Path) -> Optional[pathlib.Path]:
-    """Finds enclosing Git root purely via filesystem walk without spawning git."""
-    cur = start_path.resolve()
-    if cur.is_file():
-        cur = cur.parent
-    for candidate in (cur, *cur.parents):
-        if (candidate / ".git").exists():
-            return candidate
-    return None
 
 
 def _resolve_root_config_stop_dir(test_path: pathlib.Path) -> pathlib.Path:
@@ -1603,13 +1747,24 @@ def _guard_renegotiate(
             exit_code=1,
         )
 
-    witness_ok, witness_err, witness_proof = _verify_constructive_witness(
-        args,
-        stdout_txt,
-        stderr_txt,
-        repo_root=repo_root,
-        pinned_sha=pinned_sha_for_witness,
-    )
+    if repo_root is not None and pinned_sha_for_witness and getattr(args, "witness_type", None) in ("spec-collision", "arch-fork"):
+        with GitBatchReader(repo_root) as git_reader:
+            witness_ok, witness_err, witness_proof = _verify_constructive_witness(
+                args,
+                stdout_txt,
+                stderr_txt,
+                repo_root=repo_root,
+                pinned_sha=pinned_sha_for_witness,
+                git_reader=git_reader,
+            )
+    else:
+        witness_ok, witness_err, witness_proof = _verify_constructive_witness(
+            args,
+            stdout_txt,
+            stderr_txt,
+            repo_root=repo_root,
+            pinned_sha=pinned_sha_for_witness,
+        )
     if not witness_ok:
         if receipt_path.is_file():
             try:
@@ -1844,7 +1999,8 @@ _VALID_STATUSES = {"PENDIENTE", "EN_PROGRESO", "COMPLETADO", "FALLIDO"}
 
 def _cmd_state(args: argparse.Namespace) -> int:
     state_dir = pathlib.Path(args.dir).resolve()
-    state_dir.mkdir(parents=True, exist_ok=True)
+    if not state_dir.is_dir():
+        state_dir.mkdir(parents=True, exist_ok=True)
     action = args.state_action
 
     if action == "write":
@@ -1936,18 +2092,20 @@ def _cmd_state(args: argparse.Namespace) -> int:
         late_sealed_notices: List[Dict[str, Any]] = []
         strict_mode = bool(getattr(args, "strict", False))
 
-        candidates: List[Tuple[int, str, pathlib.Path]] = []
-        for fpath in state_dir.iterdir():
-            if fpath.is_file():
-                m = _STEP_FILE_RE.match(fpath.name)
-                if m:
-                    candidates.append((int(m.group(1)), fpath.name, fpath))
+        candidates: List[Tuple[int, str, str]] = []
+        with os.scandir(state_dir) as it:
+            for entry in it:
+                if entry.is_file():
+                    m = _STEP_FILE_RE.match(entry.name)
+                    if m:
+                        candidates.append((int(m.group(1)), entry.name, entry.path))
 
         candidates.sort(key=lambda item: (item[0], item[1]))
 
-        for _, _, fpath in candidates:
+        for _, fname, fpath_str in candidates:
             try:
-                data = json.loads(fpath.read_text(encoding="utf-8"))
+                with open(fpath_str, "r", encoding="utf-8") as sf:
+                    data = json.load(sf)
                 if not isinstance(data, dict):
                     raise ValueError("State record must be a JSON object")
                 artifacts = data.get("artifacts", {})
@@ -1955,9 +2113,8 @@ def _cmd_state(args: argparse.Namespace) -> int:
                     raise ValueError("'artifacts' field must be a JSON object")
                 dirty_record = False
                 for art_path_str, expected_hash in list(artifacts.items()):
-                    art_path = pathlib.Path(art_path_str)
                     if expected_hash == "NOT_FOUND":
-                        if art_path.is_file():
+                        if os.path.isfile(art_path_str):
                             if strict_mode:
                                 drift_warnings.append({
                                     "step": data.get("step"),
@@ -1965,7 +2122,7 @@ def _cmd_state(args: argparse.Namespace) -> int:
                                     "issue": "LATE_ARTIFACT_UNSEALED_AT_WRITE",
                                 })
                             else:
-                                new_sha = _sha256_file(art_path)
+                                new_sha = _sha256_file(art_path_str)
                                 artifacts[art_path_str] = new_sha
                                 dirty_record = True
                                 late_sealed_notices.append({
@@ -1981,14 +2138,15 @@ def _cmd_state(args: argparse.Namespace) -> int:
                                 "issue": "ARTIFACT_NEVER_EXISTED",
                             })
                     else:
-                        if not art_path.is_file():
+                        try:
+                            actual_hash = _sha256_file(art_path_str)
+                        except OSError:
                             drift_warnings.append({
                                 "step": data.get("step"),
                                 "artifact": art_path_str,
                                 "issue": "FILE_DELETED",
                             })
                         else:
-                            actual_hash = _sha256_file(art_path)
                             if actual_hash != expected_hash:
                                 drift_warnings.append({
                                     "step": data.get("step"),
@@ -1998,12 +2156,12 @@ def _cmd_state(args: argparse.Namespace) -> int:
                                     "actual": actual_hash[:12],
                                 })
                 if dirty_record:
-                    _atomic_write_json(fpath, data)
+                    _atomic_write_json(pathlib.Path(fpath_str), data)
                 records.append(data)
             except Exception as exc:
                 drift_warnings.append({
-                    "step": fpath.name.split("_", 1)[0],
-                    "artifact": str(fpath),
+                    "step": fname.split("_", 1)[0],
+                    "artifact": fpath_str,
                     "issue": "CORRUPTED_STATE_FILE",
                     "detail": str(exc),
                 })
@@ -2065,186 +2223,259 @@ def _is_test_filepath(filename: str) -> bool:
     return any(part.lower() in ("test", "tests", "testing") for part in p.parts)
 
 
-class _AntigravityVisitor:
-    def __init__(self, filename: str):
+class _LintFileContext:
+    """Mutable per-file linting state shared across SinglePassVisitor rule handlers."""
+
+    def __init__(self, filename: str, source_lines: Optional[List[str]] = None) -> None:
         self.filename = filename
         self.is_test_file = _is_test_filepath(filename)
-        self.violations: List[Dict[str, Any]] = []
+        self.source_lines: List[str] = source_lines or []
         self.ttk_module_aliases: Set[str] = {"ttk", "tkinter.ttk"}
         self.ttk_direct_imports: Dict[str, str] = {}
+        self.violations: List[Dict[str, Any]] = []
+        self.warnings: List[Dict[str, Any]] = []
+        self.suppressed_mutations: List[Dict[str, Any]] = []
 
-    def check_tree(self, tree: ast.AST) -> None:
-        """Fast two-pass ast.walk scan avoiding NodeVisitor.generic_visit getattr overhead."""
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                self._check_import(node)
-            elif isinstance(node, ast.ImportFrom):
-                self._check_import_from(node)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                self._check_call(node)
-            elif isinstance(node, ast.ExceptHandler):
-                self._check_except_handler(node)
 
-    def _check_import(self, node: ast.Import) -> None:
+def _register_ttk_import(node: ast.Import, ctx: _LintFileContext) -> None:
+    for alias in node.names:
+        if alias.name == "tkinter.ttk":
+            ctx.ttk_module_aliases.add(alias.asname or "tkinter.ttk")
+        elif alias.name == "tkinter":
+            tk_alias = alias.asname or "tkinter"
+            ctx.ttk_module_aliases.add(f"{tk_alias}.ttk")
+
+
+def _register_ttk_import_from(node: ast.ImportFrom, ctx: _LintFileContext) -> None:
+    if node.module == "tkinter":
         for alias in node.names:
-            if alias.name == "tkinter.ttk":
-                if alias.asname:
-                    self.ttk_module_aliases.add(alias.asname)
-                else:
-                    self.ttk_module_aliases.add("tkinter.ttk")
-            elif alias.name == "tkinter":
-                tk_alias = alias.asname or "tkinter"
-                self.ttk_module_aliases.add(f"{tk_alias}.ttk")
-            elif alias.name in ("unittest.mock", "mock") and not self.is_test_file:
-                self.violations.append({
-                    "file": self.filename,
+            if alias.name == "ttk":
+                ctx.ttk_module_aliases.add(alias.asname or "ttk")
+    elif node.module == "tkinter.ttk":
+        for alias in node.names:
+            if alias.name == "*":
+                for w in _TTK_WIDGETS:
+                    ctx.ttk_direct_imports[w] = w
+            elif alias.name in _TTK_WIDGETS:
+                ctx.ttk_direct_imports[alias.asname or alias.name] = alias.name
+
+
+def _prescan_top_level_ttk_imports(tree: ast.AST, ctx: _LintFileContext) -> None:
+    for stmt in getattr(tree, "body", ()):
+        if isinstance(stmt, ast.Import):
+            _register_ttk_import(stmt, ctx)
+        elif isinstance(stmt, ast.ImportFrom):
+            _register_ttk_import_from(stmt, ctx)
+
+
+def _rule_import(node: ast.AST, ctx: _LintFileContext) -> None:
+    assert isinstance(node, ast.Import)
+    _register_ttk_import(node, ctx)
+    if not ctx.is_test_file:
+        for alias in node.names:
+            if alias.name in ("unittest.mock", "mock"):
+                ctx.violations.append({
+                    "file": ctx.filename,
                     "line": node.lineno,
                     "rule": "PATH002",
                     "message": f"Mocking library '{alias.name}' imported in production module.",
                     "reflex": "Move mock objects strictly into tests/ and inject real interfaces or protocols in production code.",
                 })
 
-    def _check_import_from(self, node: ast.ImportFrom) -> None:
-        if node.module == "tkinter":
-            for alias in node.names:
-                if alias.name == "ttk":
-                    self.ttk_module_aliases.add(alias.asname or "ttk")
-        elif node.module == "tkinter.ttk":
-            for alias in node.names:
-                if alias.name == "*":
-                    for w in _TTK_WIDGETS:
-                        self.ttk_direct_imports[w] = w
-                elif alias.name in _TTK_WIDGETS:
-                    self.ttk_direct_imports[alias.asname or alias.name] = alias.name
-        elif node.module in ("unittest.mock", "mock") and not self.is_test_file:
-            self.violations.append({
-                "file": self.filename,
+
+def _rule_import_from(node: ast.AST, ctx: _LintFileContext) -> None:
+    assert isinstance(node, ast.ImportFrom)
+    _register_ttk_import_from(node, ctx)
+    if not ctx.is_test_file:
+        if node.module in ("unittest.mock", "mock"):
+            ctx.violations.append({
+                "file": ctx.filename,
                 "line": node.lineno,
                 "rule": "PATH002",
                 "message": f"Mocking primitives from '{node.module}' imported in production module.",
                 "reflex": "Remove unittest.mock imports from production modules; pass dependencies via constructor or callable parameters.",
             })
-        elif node.module == "unittest" and not self.is_test_file:
+        elif node.module == "unittest":
             for alias in node.names:
                 if alias.name == "mock":
-                    self.violations.append({
-                        "file": self.filename,
+                    ctx.violations.append({
+                        "file": ctx.filename,
                         "line": node.lineno,
                         "rule": "PATH002",
                         "message": "Mocking module 'unittest.mock' imported in production module.",
                         "reflex": "Remove unittest.mock imports from production modules; pass dependencies via constructor or callable parameters.",
                     })
 
-    def _check_except_handler(self, node: ast.ExceptHandler) -> None:
-        """
-        Rule PATH001: Catches silent broad exception swallowing (`except:` or `except Exception:`
-        followed solely by `pass`, `...`, `continue`, or trivial returns like `return {}`,
-        `return None`, `return []`) which masks broken path invariants.
-        """
-        is_broad = False
-        if node.type is None:
-            is_broad = True
-        elif isinstance(node.type, ast.Name) and node.type.id in ("Exception", "BaseException"):
-            is_broad = True
-        elif isinstance(node.type, ast.Tuple):
-            is_broad = any(
-                isinstance(elt, ast.Name) and elt.id in ("Exception", "BaseException")
-                for elt in node.type.elts
-            )
-        if is_broad and len(node.body) == 1:
-            stmt = node.body[0]
-            is_noop = isinstance(stmt, ast.Pass) or (
-                isinstance(stmt, ast.Expr)
-                and isinstance(stmt.value, ast.Constant)
-                and stmt.value.value is Ellipsis
-            )
-            is_continue = isinstance(stmt, ast.Continue)
-            is_trivial_return = False
-            if isinstance(stmt, ast.Return):
-                if stmt.value is None:
-                    is_trivial_return = True
-                elif isinstance(stmt.value, ast.Dict) and len(stmt.value.keys) == 0:
-                    is_trivial_return = True
-                elif isinstance(stmt.value, (ast.List, ast.Tuple, ast.Set)) and len(stmt.value.elts) == 0:
-                    is_trivial_return = True
-                elif isinstance(stmt.value, ast.Constant) and stmt.value.value in (None, False, ""):
-                    is_trivial_return = True
 
-            if is_noop or is_continue or is_trivial_return:
-                if is_continue:
-                    detail = "continue"
-                elif is_trivial_return:
-                    if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Dict):
-                        detail = "return {}"
-                    else:
-                        detail = "trivial return"
+def _rule_path001_except(node: ast.AST, ctx: _LintFileContext) -> None:
+    """
+    Rule PATH001: Catches silent broad exception swallowing (`except:` or `except Exception:`
+    followed solely by `pass`, `...`, `continue`, or trivial returns like `return {}`,
+    `return None`, `return []`) which masks broken path invariants.
+    """
+    assert isinstance(node, ast.ExceptHandler)
+    is_broad = False
+    if node.type is None:
+        is_broad = True
+    elif isinstance(node.type, ast.Name) and node.type.id in ("Exception", "BaseException"):
+        is_broad = True
+    elif isinstance(node.type, ast.Tuple):
+        is_broad = any(
+            isinstance(elt, ast.Name) and elt.id in ("Exception", "BaseException")
+            for elt in node.type.elts
+        )
+    if is_broad and len(node.body) == 1:
+        stmt = node.body[0]
+        is_noop = isinstance(stmt, ast.Pass) or (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and stmt.value.value is Ellipsis
+        )
+        is_continue = isinstance(stmt, ast.Continue)
+        is_trivial_return = False
+        if isinstance(stmt, ast.Return):
+            if stmt.value is None:
+                is_trivial_return = True
+            elif isinstance(stmt.value, ast.Dict) and len(stmt.value.keys) == 0:
+                is_trivial_return = True
+            elif isinstance(stmt.value, (ast.List, ast.Tuple, ast.Set)) and len(stmt.value.elts) == 0:
+                is_trivial_return = True
+            elif isinstance(stmt.value, ast.Constant) and stmt.value.value in (None, False, ""):
+                is_trivial_return = True
+
+        if is_noop or is_continue or is_trivial_return:
+            if is_continue:
+                detail = "continue"
+            elif is_trivial_return:
+                if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Dict):
+                    detail = "return {}"
                 else:
-                    detail = "pass"
+                    detail = "trivial return"
+            else:
+                detail = "pass"
 
-                self.violations.append({
-                    "file": self.filename,
-                    "line": node.lineno,
-                    "rule": "PATH001",
-                    "message": f"Silent broad exception swallowing ('except: {detail}') hides broken path invariants.",
-                    "reflex": "Catch a specific exception type and log/handle the failure context, or re-raise the error.",
-                })
+            ctx.violations.append({
+                "file": ctx.filename,
+                "line": node.lineno,
+                "rule": "PATH001",
+                "message": f"Silent broad exception swallowing ('except: {detail}') hides broken path invariants.",
+                "reflex": "Catch a specific exception type and log/handle the failure context, or re-raise the error.",
+            })
 
-    def _check_call(self, node: ast.Call) -> None:
-        widget_canonical = ""
-        is_ttk = False
 
-        if isinstance(node.func, ast.Attribute):
-            func_name = node.func.attr
-            prefix = _dotted_name(node.func.value)
-            if prefix in self.ttk_module_aliases and func_name in _TTK_WIDGETS:
-                is_ttk = True
-                widget_canonical = func_name
-        elif isinstance(node.func, ast.Name):
-            func_name = node.func.id
-            if func_name in self.ttk_direct_imports:
-                is_ttk = True
-                widget_canonical = self.ttk_direct_imports[func_name]
+def _check_font_node(node_val: ast.AST, lineno: int, ctx: _LintFileContext) -> None:
+    if isinstance(node_val, (ast.Tuple, ast.List)) and len(node_val.elts) >= 2:
+        size_node = node_val.elts[1]
+        float_val: Optional[float] = None
+        if isinstance(size_node, ast.Constant) and isinstance(size_node.value, float):
+            float_val = size_node.value
+        elif (
+            isinstance(size_node, ast.UnaryOp)
+            and isinstance(size_node.op, (ast.USub, ast.UAdd))
+            and isinstance(size_node.operand, ast.Constant)
+            and isinstance(size_node.operand.value, float)
+        ):
+            float_val = -size_node.operand.value if isinstance(size_node.op, ast.USub) else size_node.operand.value
 
-        # Rule TK002: forbidden background/foreground on confirmed ttk widgets only
-        if is_ttk:
-            for kw in node.keywords:
-                if kw.arg in ("background", "foreground", "bg", "fg"):
-                    self.violations.append({
-                        "file": self.filename,
-                        "line": node.lineno,
-                        "rule": "TK002",
-                        "message": f"Direct '{kw.arg}=' argument forbidden on ttk.{widget_canonical}. Use ttk.Style() or tk equivalent.",
-                        "reflex": f"Configure '{kw.arg}' via ttk.Style().configure('<Style>.T{widget_canonical}', ...) or switch to tk.{widget_canonical}.",
-                    })
+        if float_val is not None:
+            ctx.violations.append({
+                "file": ctx.filename,
+                "line": lineno,
+                "rule": "TK001",
+                "message": f"Float font size {float_val} forbidden in font tuple. Use integer.",
+                "reflex": f"Replace float font size {float_val} with integer {int(round(float_val))} in the font tuple.",
+            })
 
-        # Rule TK001: float font size check
+
+def _rule_call_tk(node: ast.AST, ctx: _LintFileContext) -> None:
+    assert isinstance(node, ast.Call)
+    widget_canonical = ""
+    is_ttk = False
+
+    if isinstance(node.func, ast.Attribute):
+        func_name = node.func.attr
+        prefix = _dotted_name(node.func.value)
+        if prefix in ctx.ttk_module_aliases and func_name in _TTK_WIDGETS:
+            is_ttk = True
+            widget_canonical = func_name
+    elif isinstance(node.func, ast.Name):
+        func_name = node.func.id
+        if func_name in ctx.ttk_direct_imports:
+            is_ttk = True
+            widget_canonical = ctx.ttk_direct_imports[func_name]
+
+    if is_ttk:
         for kw in node.keywords:
-            if kw.arg == "font":
-                self._check_font_node(kw.value, node.lineno)
-
-    def _check_font_node(self, node_val: ast.AST, lineno: int) -> None:
-        if isinstance(node_val, (ast.Tuple, ast.List)) and len(node_val.elts) >= 2:
-            size_node = node_val.elts[1]
-            float_val: Optional[float] = None
-            if isinstance(size_node, ast.Constant) and isinstance(size_node.value, float):
-                float_val = size_node.value
-            elif (
-                isinstance(size_node, ast.UnaryOp)
-                and isinstance(size_node.op, (ast.USub, ast.UAdd))
-                and isinstance(size_node.operand, ast.Constant)
-                and isinstance(size_node.operand.value, float)
-            ):
-                float_val = -size_node.operand.value if isinstance(size_node.op, ast.USub) else size_node.operand.value
-
-            if float_val is not None:
-                self.violations.append({
-                    "file": self.filename,
-                    "line": lineno,
-                    "rule": "TK001",
-                    "message": f"Float font size {float_val} forbidden in font tuple. Use integer.",
-                    "reflex": f"Replace float font size {float_val} with integer {int(round(float_val))} in the font tuple.",
+            if kw.arg in ("background", "foreground", "bg", "fg"):
+                ctx.violations.append({
+                    "file": ctx.filename,
+                    "line": node.lineno,
+                    "rule": "TK002",
+                    "message": f"Direct '{kw.arg}=' argument forbidden on ttk.{widget_canonical}. Use ttk.Style() or tk equivalent.",
+                    "reflex": f"Configure '{kw.arg}' via ttk.Style().configure('<Style>.T{widget_canonical}', ...) or switch to tk.{widget_canonical}.",
                 })
+
+    for kw in node.keywords:
+        if kw.arg == "font":
+            _check_font_node(kw.value, node.lineno, ctx)
+
+
+_RuleFn = Callable[[ast.AST, _LintFileContext], None]
+
+_DEFAULT_LINT_DISPATCH: Dict[Type[ast.AST], List[_RuleFn]] = {
+    ast.Import: [_rule_import],
+    ast.ImportFrom: [_rule_import_from],
+    ast.Call: [_rule_call_tk],
+    ast.ExceptHandler: [_rule_path001_except],
+}
+
+
+class SinglePassVisitor(ast.NodeVisitor):
+    """Single-pass iterative AST NodeVisitor dispatching rules via node-type lookup table."""
+
+    def __init__(
+        self,
+        ctx: _LintFileContext,
+        dispatch: Optional[Dict[Type[ast.AST], List[_RuleFn]]] = None,
+    ) -> None:
+        self.ctx = ctx
+        self.dispatch = dispatch if dispatch is not None else _DEFAULT_LINT_DISPATCH
+
+    def visit(self, node: ast.AST) -> None:
+        dispatch = self.dispatch
+        ctx = self.ctx
+        ast_type = ast.AST
+        stack: List[ast.AST] = [node]
+        while stack:
+            curr = stack.pop()
+            handlers = dispatch.get(type(curr))
+            if handlers:
+                for fn in handlers:
+                    fn(curr, ctx)
+            for fname in reversed(curr._fields):
+                val = getattr(curr, fname, None)
+                if isinstance(val, ast_type):
+                    stack.append(val)
+                elif isinstance(val, list):
+                    for item in reversed(val):
+                        if isinstance(item, ast_type):
+                            stack.append(item)
+
+
+class _AntigravityVisitor:
+    """Compatibility wrapper around SinglePassVisitor + _LintFileContext."""
+
+    def __init__(self, filename: str, source_lines: Optional[List[str]] = None) -> None:
+        self.ctx = _LintFileContext(filename, source_lines=source_lines)
+        self.filename = filename
+        self.is_test_file = self.ctx.is_test_file
+        self.violations = self.ctx.violations
+        self.ttk_module_aliases = self.ctx.ttk_module_aliases
+        self.ttk_direct_imports = self.ctx.ttk_direct_imports
+
+    def check_tree(self, tree: ast.AST) -> None:
+        _prescan_top_level_ttk_imports(tree, self.ctx)
+        SinglePassVisitor(self.ctx).visit(tree)
 
 
 def _strip_dot_comments_preserve_lines(source: str) -> str:
@@ -2497,15 +2728,41 @@ def _apply_context_signatures(
     return enforced, probationary
 
 
-def _lint_file(py_path: pathlib.Path, author_target: Optional[str] = None) -> List[Dict[str, Any]]:
-    violations: List[Dict[str, Any]] = []
-    try:
-        source = py_path.read_text(encoding="utf-8", errors="replace")
-    except Exception as exc:
-        return [{"file": str(py_path), "line": 1, "rule": "IO_ERROR", "message": str(exc)}]
+_STAT_CACHE_ANTI_RACY_NS = 50_000_000  # 50 ms NTFS/POSIX mtime granularity guard
 
+
+def _ast_rules_hash(author_target: Optional[str]) -> str:
+    raw = f"{_SCHEMA_VERSION}:TK001,TK002,PATH001,PATH002,AUTH001,MUT001:{author_target or ''}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _resolve_stat_cache_path(target_path: pathlib.Path) -> pathlib.Path:
+    git_root = _find_git_root_pure(target_path)
+    base_dir = git_root if git_root is not None else (target_path if target_path.is_dir() else target_path.parent)
+    return base_dir / ".ag_state" / "stat_cache.json"
+
+
+def _load_stat_cache(cache_path: pathlib.Path) -> Dict[str, Any]:
+    if not cache_path.is_file():
+        return {"version": _SCHEMA_VERSION, "entries": {}, "results": {}}
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("entries"), dict) and isinstance(data.get("results"), dict):
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"version": _SCHEMA_VERSION, "entries": {}, "results": {}}
+
+
+def _lint_python_source(
+    py_path: pathlib.Path,
+    source: str,
+    author_target: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    violations: List[Dict[str, Any]] = []
+    source_lines = source.splitlines()
     if author_target:
-        lines = source.splitlines()[:25]
+        lines = source_lines[:25]
         if not any(author_target.lower() in line.lower() for line in lines):
             violations.append({
                 "file": str(py_path),
@@ -2525,11 +2782,21 @@ def _lint_file(py_path: pathlib.Path, author_target: Optional[str] = None) -> Li
             "message": f"SyntaxError: {exc.msg}",
             "reflex": "Fix the Python syntax error before running static or runtime checks.",
         })
-        return violations
+        return violations, [], []
 
-    visitor = _AntigravityVisitor(str(py_path))
-    visitor.check_tree(tree)
-    violations.extend(visitor.violations)
+    ctx = _LintFileContext(str(py_path), source_lines=source_lines)
+    _prescan_top_level_ttk_imports(tree, ctx)
+    SinglePassVisitor(ctx).visit(tree)
+    violations.extend(ctx.violations)
+    return violations, ctx.warnings, ctx.suppressed_mutations
+
+
+def _lint_file(py_path: pathlib.Path, author_target: Optional[str] = None) -> List[Dict[str, Any]]:
+    try:
+        source = py_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [{"file": str(py_path), "line": 1, "rule": "IO_ERROR", "message": str(exc)}]
+    violations, _, _ = _lint_python_source(py_path, source, author_target)
     return violations
 
 
@@ -2544,16 +2811,86 @@ def _cmd_ast_lint(args: argparse.Namespace) -> int:
 
     author_param = (getattr(args, "author", None) or "").strip() or None
     context_sigs = _load_context_signatures(getattr(args, "context_map", None))
+    strict_mode = bool(getattr(args, "strict", False))
+    no_cache = bool(getattr(args, "no_cache", False))
+    cache_enabled = not strict_mode and not no_cache
     t0 = time.perf_counter()
+
+    cache_path = _resolve_stat_cache_path(target_path) if cache_enabled else None
+    cache_data = _load_stat_cache(cache_path) if cache_path is not None else {"entries": {}, "results": {}}
+    cache_entries: Dict[str, Any] = cache_data["entries"]
+    cache_results: Dict[str, Any] = cache_data["results"]
+    rules_hash = _ast_rules_hash(author_param)
+    cache_dirty = False
+    now_ns = time.time_ns()
 
     raw_violations: List[Dict[str, Any]] = []
     files_checked = 0
+    cache_hits = 0
 
     ignore_dirs = {".git", ".venv", "venv", "node_modules", "site-packages", "__pycache__", "build", "dist"}
 
+    def _lint_py_cached(fpath: pathlib.Path) -> None:
+        nonlocal cache_dirty, cache_hits
+        if cache_path is not None:
+            try:
+                rel_key = fpath.relative_to(cache_path.parent.parent).as_posix()
+            except ValueError:
+                rel_key = fpath.as_posix()
+        else:
+            rel_key = fpath.as_posix()
+        if cache_enabled:
+            try:
+                st = fpath.stat()
+                if st.st_mtime_ns <= now_ns and (now_ns - st.st_mtime_ns) >= _STAT_CACHE_ANTI_RACY_NS:
+                    entry = cache_entries.get(rel_key)
+                    if (
+                        isinstance(entry, list)
+                        and len(entry) == 4
+                        and entry[0] == st.st_mtime_ns
+                        and entry[1] == st.st_size
+                        and entry[3] == rules_hash
+                    ):
+                        cached_res = cache_results.get(rel_key)
+                        if isinstance(cached_res, dict):
+                            for item in cached_res.get("violations", []):
+                                raw_violations.append(dict(item))
+                            cache_hits += 1
+                            return
+            except OSError:
+                st = None
+        else:
+            st = None
+
+        try:
+            raw_bytes = fpath.read_bytes()
+        except OSError as exc:
+            raw_violations.append({"file": str(fpath), "line": 1, "rule": "IO_ERROR", "message": str(exc)})
+            return
+
+        source = raw_bytes.decode("utf-8", errors="replace")
+        file_violations, file_warnings, file_suppressed = _lint_python_source(fpath, source, author_param)
+        raw_violations.extend(file_violations)
+
+        if cache_enabled:
+            try:
+                if st is None:
+                    st = fpath.stat()
+                if st.st_mtime_ns <= now_ns:
+                    file_sha = hashlib.sha256(raw_bytes).hexdigest()
+                    cache_entries[rel_key] = [st.st_mtime_ns, st.st_size, file_sha, rules_hash]
+                    cache_results[rel_key] = {
+                        "violations": [dict(v) for v in file_violations],
+                        "warnings": [dict(w) for w in file_warnings],
+                        "suppressed_mutations": [dict(s) for s in file_suppressed],
+                    }
+                    cache_dirty = True
+            except OSError:
+                pass
+
     if target_path.is_file():
         if target_path.suffix == ".py":
-            raw_violations.extend(_lint_file(target_path, author_param))
+            _lint_py_cached(target_path)
             files_checked = 1
         elif target_path.suffix == ".dot":
             raw_violations.extend(_lint_dot_state_machine(target_path))
@@ -2571,11 +2908,17 @@ def _cmd_ast_lint(args: argparse.Namespace) -> int:
             for fname in sorted(files):
                 fpath = pathlib.Path(root) / fname
                 if fname.endswith(".py"):
-                    raw_violations.extend(_lint_file(fpath, author_param))
+                    _lint_py_cached(fpath)
                     files_checked += 1
                 elif include_dot and fname.endswith(".dot"):
                     raw_violations.extend(_lint_dot_state_machine(fpath))
                     files_checked += 1
+
+    if cache_enabled and cache_dirty and cache_path is not None:
+        try:
+            _atomic_write_json(cache_path, cache_data)
+        except OSError as exc:
+            sys.stderr.write(f"[ag_ops] Warning: could not persist stat cache to {cache_path}: {exc}\n")
 
     enforced_violations, probationary_warnings = _apply_context_signatures(raw_violations, context_sigs)
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 3)
@@ -2584,6 +2927,7 @@ def _cmd_ast_lint(args: argparse.Namespace) -> int:
         "ok": len(enforced_violations) == 0,
         "elapsed_ms": elapsed_ms,
         "files_checked": files_checked,
+        "cache_hits": cache_hits,
         "violations_count": len(enforced_violations),
         "violations": enforced_violations,
     }
@@ -2591,7 +2935,7 @@ def _cmd_ast_lint(args: argparse.Namespace) -> int:
         payload["probationary_count"] = len(probationary_warnings)
         payload["probationary_warnings"] = probationary_warnings
 
-    if getattr(args, "strict", False) and probationary_warnings:
+    if strict_mode and probationary_warnings:
         payload["ok"] = False
         payload["error"] = "STRICT_PROBATIONARY: Findings degraded to probationary status rejected under --strict."
         return _emit(payload, args.json, exit_code=2)
@@ -2653,16 +2997,10 @@ class _FuncHashVisitor(ast.NodeVisitor):
         stripped_body = _strip_leading_docstring(node.body)
         clone = copy.deepcopy(node)
         clone.body = stripped_body
-        ast.copy_location(clone, node)
-        ast.fix_missing_locations(clone)
         exact_dump = ast.dump(clone, include_attributes=False)
         exact_hash = hashlib.sha256(exact_dump.encode("utf-8")).hexdigest()
 
-        try:
-            target_tree = ast.parse(ast.unparse(clone)) if hasattr(ast, "unparse") else clone
-        except Exception:
-            target_tree = clone
-        scrubbed_tree = _StringLiteralScrubber().visit(target_tree)
+        scrubbed_tree = _StringLiteralScrubber().visit(clone)
         struct_dump = ast.dump(scrubbed_tree, include_attributes=False)
         struct_hash = hashlib.sha256(struct_dump.encode("utf-8")).hexdigest()
         return exact_hash, struct_hash
@@ -2733,6 +3071,91 @@ def _git_changed_line_sets(repo_path: pathlib.Path, commit_sha: str, rel_file: s
             if clean:
                 deleted.add(clean)
     return added, deleted
+
+
+def _git_batch_changed_line_sets(
+    repo_path: pathlib.Path,
+    commit_shas: List[str],
+    rel_files: List[str],
+) -> Dict[Tuple[str, str], Tuple[Set[str], Set[str]]]:
+    """Loads (added_lines, deleted_lines) for multiple commits/files in one Git process."""
+    result: Dict[Tuple[str, str], Tuple[Set[str], Set[str]]] = {}
+    if not commit_shas or not rel_files:
+        return result
+    git_bin = _resolve_git_binary()
+    cmd = [
+        git_bin,
+        "-C", str(repo_path),
+        "-c", "core.quotepath=false",
+        "-c", "diff.mnemonicPrefix=false",
+        "-c", "diff.noprefix=false",
+        "log",
+        "--no-walk",
+        "--stdin",
+        "--format=COMMIT|%H",
+        "--unified=0",
+        "--no-renames",
+        "-m",
+        "--first-parent",
+        "-p",
+        "--",
+        *rel_files,
+    ]
+    kwargs: Dict[str, Any] = {
+        "input": "\n".join(commit_shas) + "\n",
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": 15.0,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    try:
+        proc = subprocess.run(cmd, **kwargs)  # nosec B603
+    except (OSError, subprocess.SubprocessError):
+        return result
+    if proc.returncode != 0:
+        return result
+
+    cur_sha: Optional[str] = None
+    cur_file: Optional[str] = None
+    minus_file: Optional[str] = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("COMMIT|"):
+            cur_sha = line[7:].strip()
+            cur_file = None
+            minus_file = None
+            continue
+        if cur_sha is None:
+            continue
+        if line.startswith("diff --git "):
+            cur_file = None
+            minus_file = None
+            continue
+        if line.startswith("--- "):
+            raw_old = line[4:].strip()
+            minus_file = raw_old[2:] if raw_old.startswith("a/") else (None if raw_old == "/dev/null" else raw_old)
+            continue
+        if line.startswith("+++ "):
+            raw_new = line[4:].strip()
+            plus_file = raw_new[2:] if raw_new.startswith("b/") else (None if raw_new == "/dev/null" else raw_new)
+            cur_file = plus_file or minus_file
+            if cur_file is not None:
+                result.setdefault((cur_sha, cur_file), (set(), set()))
+            continue
+        if cur_file is None or line.startswith("@@") or line.startswith("index ") or line.startswith("\\"):
+            continue
+        if line.startswith("+"):
+            clean = line[1:].strip()
+            if clean:
+                result.setdefault((cur_sha, cur_file), (set(), set()))[0].add(clean)
+        elif line.startswith("-"):
+            clean = line[1:].strip()
+            if clean:
+                result.setdefault((cur_sha, cur_file), (set(), set()))[1].add(clean)
+    return result
 
 
 def _parse_iso_utc_ts(ts_str: str) -> Optional[int]:
@@ -2832,101 +3255,108 @@ def _cmd_regret_mine(args: argparse.Namespace) -> int:
     tdd_refactors_filtered = 0
     string_only_edits_filtered = 0
 
-    # Memoization caches to avoid redundant `git show` + `ast.parse` calls across commit pairs
+    # Memoization caches to avoid redundant `git cat-file` + `ast.parse` calls across commit pairs
     ast_defs_cache: Dict[Tuple[str, str], Dict[str, Tuple[str, str]]] = {}
     diff_lines_cache: Dict[Tuple[str, str], Tuple[Set[str], Set[str]]] = {}
+    diff_batch_loaded = False
 
-    def _get_cached_defs(commit_sha: str, rel_file: str) -> Dict[str, Tuple[str, str]]:
-        key = (commit_sha, rel_file)
-        if key not in ast_defs_cache:
-            _, src_txt, _, _, _ = _run_command_isolated(
-                [git_bin, "-C", str(repo_path), "-c", "core.quotepath=false", "show", f"{commit_sha}:{rel_file}"],
-                5.0,
-            )
-            ast_defs_cache[key] = _extract_ast_function_hashes(src_txt)
-        return ast_defs_cache[key]
+    with GitBatchReader(repo_path) as git_reader:
+        def _get_cached_defs(commit_sha: str, rel_file: str) -> Dict[str, Tuple[str, str]]:
+            key = (commit_sha, rel_file)
+            if key not in ast_defs_cache:
+                src_txt = git_reader.read_text(commit_sha, rel_file) or ""
+                ast_defs_cache[key] = _extract_ast_function_hashes(src_txt)
+            return ast_defs_cache[key]
 
-    def _get_cached_diff_lines(commit_sha: str, rel_file: str) -> Tuple[Set[str], Set[str]]:
-        key = (commit_sha, rel_file)
-        if key not in diff_lines_cache:
-            diff_lines_cache[key] = _git_changed_line_sets(repo_path, commit_sha, rel_file)
-        return diff_lines_cache[key]
+        def _get_cached_diff_lines(commit_sha: str, rel_file: str) -> Tuple[Set[str], Set[str]]:
+            nonlocal diff_batch_loaded
+            key = (commit_sha, rel_file)
+            if not diff_batch_loaded and key not in diff_lines_cache:
+                diff_batch_loaded = True
+                candidate_shas = [c["sha"] for c in commits]
+                candidate_files = sorted({pf for c in commits for pf in c["py_files"]})
+                batch_diffs = _git_batch_changed_line_sets(repo_path, candidate_shas, candidate_files)
+                for b_key, b_val in batch_diffs.items():
+                    diff_lines_cache.setdefault(b_key, b_val)
+            if key not in diff_lines_cache:
+                diff_lines_cache[key] = (set(), set())
+            return diff_lines_cache[key]
 
-    # commits are ordered newest (index i) to oldest (index j).
-    # Track paired_files per 'newer' commit so each file is only compared against
-    # its immediately preceding commit C_k -> C_{k+1} (no transitive C1 -> C3 duplicates).
-    for i in range(len(commits) - 1):
-        newer = commits[i]
-        paired_files: Set[str] = set()
+        # commits are ordered newest (index i) to oldest (index j).
+        # Track paired_files per 'newer' commit so each file is only compared against
+        # its immediately preceding commit C_k -> C_{k+1} (no transitive C1 -> C3 duplicates).
+        for i in range(len(commits) - 1):
+            newer = commits[i]
+            paired_files: Set[str] = set()
 
-        for j in range(i + 1, len(commits)):
-            older = commits[j]
-            delta_sec = newer["ts"] - older["ts"]
-            if delta_sec > window_sec:
-                break
-            if delta_sec < 0 and abs(delta_sec) > window_sec:
-                continue
-            abs_delta_sec = abs(delta_sec)
+            for j in range(i + 1, len(commits)):
+                older = commits[j]
+                delta_sec = newer["ts"] - older["ts"]
+                if delta_sec > window_sec:
+                    break
+                if delta_sec < 0 and abs(delta_sec) > window_sec:
+                    continue
+                abs_delta_sec = abs(delta_sec)
 
-            shared_py = (set(newer["py_files"]) & set(older["py_files"])) - paired_files
-            if not shared_py:
-                continue
-
-            for rel_file in sorted(shared_py):
-                paired_files.add(rel_file)
-
-                defs_new = _get_cached_defs(newer["sha"], rel_file)
-                defs_old = _get_cached_defs(older["sha"], rel_file)
-
-                exact_changed_funcs = [
-                    fn for fn in defs_new
-                    if fn in defs_old and defs_new[fn][0] != defs_old[fn][0]
-                ]
-                if not exact_changed_funcs:
+                shared_py = (set(newer["py_files"]) & set(older["py_files"])) - paired_files
+                if not shared_py:
                     continue
 
-                # Filter out functions where only string literals (typos/messages) changed
-                overlapping_funcs = [
-                    fn for fn in exact_changed_funcs
-                    if defs_new[fn][1] != defs_old[fn][1]
-                ]
-                if not overlapping_funcs:
-                    string_only_edits_filtered += 1
-                    continue
+                for rel_file in sorted(shared_py):
+                    paired_files.add(rel_file)
 
-                has_fix_verb = bool(_FIX_VERB_RE.search(newer["subject"]))
-                is_pure_refactor = bool(_REFACTOR_VERB_RE.search(newer["subject"])) and not has_fix_verb
+                    defs_new = _get_cached_defs(newer["sha"], rel_file)
+                    defs_old = _get_cached_defs(older["sha"], rel_file)
 
-                signals: List[str] = []
-                if has_fix_verb:
-                    signals.append("FIX_VERB_INTENT")
-                if len(newer["test_files"]) > 0:
-                    signals.append("TEST_ASSERTION_DELTA")
-                low_ts, high_ts = min(older["ts"], newer["ts"]), max(older["ts"], newer["ts"])
-                if any(low_ts <= ev_ts <= high_ts for ev_ts in receipt_events_ts):
-                    signals.append("GUARD_COLLISION_RECEIPT")
+                    exact_changed_funcs = [
+                        fn for fn in defs_new
+                        if fn in defs_old and defs_new[fn][0] != defs_old[fn][0]
+                    ]
+                    if not exact_changed_funcs:
+                        continue
 
-                if not is_pure_refactor:
-                    added_k, _ = _get_cached_diff_lines(older["sha"], rel_file)
-                    _, deleted_k1 = _get_cached_diff_lines(newer["sha"], rel_file)
-                    inverted_lines = added_k & deleted_k1
-                    has_guard_inversion = any(_CONTROL_GUARD_RE.search(line) for line in inverted_lines)
-                    if inverted_lines and (has_guard_inversion or len(signals) > 0):
-                        signals.append("LINE_REVERSAL_OVERLAP")
+                    # Filter out functions where only string literals (typos/messages) changed
+                    overlapping_funcs = [
+                        fn for fn in exact_changed_funcs
+                        if defs_new[fn][1] != defs_old[fn][1]
+                    ]
+                    if not overlapping_funcs:
+                        string_only_edits_filtered += 1
+                        continue
 
-                if not signals:
-                    tdd_refactors_filtered += 1
-                    continue
+                    has_fix_verb = bool(_FIX_VERB_RE.search(newer["subject"]))
+                    is_pure_refactor = bool(_REFACTOR_VERB_RE.search(newer["subject"])) and not has_fix_verb
 
-                regret_pairs.append({
-                    "file": rel_file,
-                    "overlapping_functions": overlapping_funcs,
-                    "delta_minutes": round(abs_delta_sec / 60.0, 2),
-                    "initial_commit": older["sha"][:8],
-                    "regret_commit": newer["sha"][:8],
-                    "regret_subject": newer["subject"],
-                    "asymmetry_signals": signals,
-                })
+                    signals: List[str] = []
+                    if has_fix_verb:
+                        signals.append("FIX_VERB_INTENT")
+                    if len(newer["test_files"]) > 0:
+                        signals.append("TEST_ASSERTION_DELTA")
+                    low_ts, high_ts = min(older["ts"], newer["ts"]), max(older["ts"], newer["ts"])
+                    if any(low_ts <= ev_ts <= high_ts for ev_ts in receipt_events_ts):
+                        signals.append("GUARD_COLLISION_RECEIPT")
+
+                    if not is_pure_refactor:
+                        added_k, _ = _get_cached_diff_lines(older["sha"], rel_file)
+                        _, deleted_k1 = _get_cached_diff_lines(newer["sha"], rel_file)
+                        inverted_lines = added_k & deleted_k1
+                        has_guard_inversion = any(_CONTROL_GUARD_RE.search(line) for line in inverted_lines)
+                        if inverted_lines and (has_guard_inversion or len(signals) > 0):
+                            signals.append("LINE_REVERSAL_OVERLAP")
+
+                    if not signals:
+                        tdd_refactors_filtered += 1
+                        continue
+
+                    regret_pairs.append({
+                        "file": rel_file,
+                        "overlapping_functions": overlapping_funcs,
+                        "delta_minutes": round(abs_delta_sec / 60.0, 2),
+                        "initial_commit": older["sha"][:8],
+                        "regret_commit": newer["sha"][:8],
+                        "regret_subject": newer["subject"],
+                        "asymmetry_signals": signals,
+                    })
 
     return _emit(
         {
@@ -3007,6 +3437,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_lint.add_argument("--include-dot", action="store_true", help="Also lint .dot state machine files when target is a directory.")
     p_lint.add_argument("--context-map", default=None, help="Path to JSON mapping rule IDs to anchor file SHA-256 signatures.")
     p_lint.add_argument("--strict", action="store_true", help="Rejects probationary findings with STRICT_PROBATIONARY (exit code 2) if anchor drift occurred.")
+    p_lint.add_argument("--no-cache", action="store_true", help="Disable incremental .ag_state/stat_cache.json lookup.")
     p_lint.add_argument("--json", action="store_true", help="Emit deterministic JSON.")
 
     # 5. regret-mine
