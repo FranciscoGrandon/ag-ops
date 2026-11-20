@@ -206,11 +206,11 @@ Para evitar evaluar las garantías únicamente con pruebas unitarias favorables 
 
 | Categoría de Fallo | Escenarios | Detectados | Escapes | Tasa de Detección | Latencia Media Medida | Subcomandos Evaluados |
 | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **1. Alucinaciones** | 6 | 4 | 2 | **66.7 %** | 38.86 ms | `ast-lint`, `guard witness-red` |
-| **2. Manipulación de Pruebas** | 12 | 12 | 0 | **100.0 %** | 194.12 ms | `guard witness-red`, `guard verify-green` |
-| **3. Pérdida de Contexto** | 6 | 5 | 1 | **83.3 %** | 4.42 ms | `ast-lint`, `state status --strict` |
-| **4. Falsas Justificaciones** | 6 | 5 | 1 | **83.3 %** | 277.10 ms | `guard renegotiate` |
-| **5. Regresiones** | 6 | 5 | 1 | **83.3 %** | 205.92 ms | `regret-mine`, `guard verify-green`, `state status --strict` |
+| **1. Alucinaciones** | 6 | 4 | 2 | **66.7 %** | 34.49 ms | `ast-lint`, `guard witness-red` |
+| **2. Manipulación de Pruebas** | 12 | 12 | 0 | **100.0 %** | 209.87 ms | `guard witness-red`, `guard verify-green` |
+| **3. Pérdida de Contexto** | 6 | 5 | 1 | **83.3 %** | 3.26 ms | `ast-lint`, `state status --strict` |
+| **4. Falsas Justificaciones** | 6 | 5 | 1 | **83.3 %** | 274.54 ms | `guard renegotiate` |
+| **5. Regresiones** | 6 | 5 | 1 | **83.3 %** | 189.98 ms | `regret-mine`, `guard verify-green`, `state status --strict` |
 | **TOTAL GLOBAL** | **36** | **31** | **5** | **86.11 %** | **—** | **Todos los subsistemas** |
 
 ```text
