@@ -3,13 +3,14 @@
 # Creado por Francisco Grandón Vergara
 # Licensed under the MIT License
 """
-ag_ops.py (v2.3) - Deterministic CLI Engine for Agent Governance, Merkle Guardrails,
+ag_ops.py (v2.4) - Deterministic CLI Engine for Agent Governance, Merkle Guardrails,
 Git-Anchored Constructive Witnesses, Log Distillation, Lexical Runlevels,
-AST/DOT Validation, and Rapid-Regret Mining.
+AST/DOT Validation, Scope/Cycle Governance, and Rapid-Regret Mining.
 """
 
 import argparse
 import ast
+import configparser
 import copy
 import datetime
 import errno
@@ -19,6 +20,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import signal
 import subprocess  # nosec B404
@@ -26,6 +28,11 @@ import sys
 import tempfile
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    tomllib = None  # type: ignore[assignment]
 
 # =============================================================================
 # TRANSVERSAL UTILITIES
@@ -116,7 +123,11 @@ def _resolve_git_binary() -> str:
     return "git"
 
 
-def _run_command_isolated(cmd: Union[str, List[str]], timeout_sec: Optional[float] = None) -> Tuple[int, str, str, bool, float]:
+def _run_command_isolated(
+    cmd: Union[str, List[str]],
+    timeout_sec: Optional[float] = None,
+    env: Optional[Dict[str, str]] = None,
+) -> Tuple[int, str, str, bool, float]:
     """
     Executes a shell command (str) or direct argv command (List[str]) in an isolated
     process group, killing the entire process tree on timeout so inherited stdout/stderr
@@ -132,6 +143,8 @@ def _run_command_isolated(cmd: Union[str, List[str]], timeout_sec: Optional[floa
         "encoding": "utf-8",
         "errors": "replace",
     }
+    if env is not None:
+        kwargs["env"] = env
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
@@ -310,6 +323,43 @@ def _emit(payload: Dict[str, Any], as_json: bool, exit_code: int = 0) -> int:
 # =============================================================================
 # SUBCOMMAND 1: GUARD (Merkle Lock, Witnessed Red & Constructive Renegotiate)
 # =============================================================================
+
+_SCHEMA_VERSION = "2.4"
+_ROOT_CONFIG_FILENAMES: Tuple[str, ...] = (
+    "conftest.py",
+    "pytest.ini",
+    "pyproject.toml",
+    "setup.cfg",
+    "tox.ini",
+    "sitecustomize.py",
+    "usercustomize.py",
+)
+_PYTEST_INI_CONFIG_FILENAMES: Tuple[str, ...] = (
+    "pyproject.toml",
+    "pytest.ini",
+    "tox.ini",
+    "setup.cfg",
+)
+_TAINTED_ENV_KEYS: Tuple[str, ...] = ("PYTEST_ADDOPTS", "PYTHONSTARTUP")
+_ALWAYS_FORBIDDEN_ADDOPTS: Set[str] = {
+    "--collect-only",
+    "--co",
+    "--setup-only",
+    "--setup-plan",
+}
+_CMD_DECLARED_ADDOPTS: Tuple[str, ...] = ("--ignore", "--ignore-glob", "-k")
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_PYTEST_SUMMARY_LINE_RE = re.compile(
+    r"(?:\b(?:passed|failed|errors?|skipped|xfailed|xpassed|deselected)\b.*\bin\s+\d+(?:\.\d+)?s\b|\bno tests ran\b)",
+    re.I,
+)
+_PYTEST_COUNT_TOKEN_RE = re.compile(
+    r"\b(\d+)\s+(passed|failed|errors?|skipped|xfailed|xpassed|deselected)\b",
+    re.I,
+)
+_PYTEST_COLLECTED_ZERO_RE = re.compile(r"\bcollected\s+0\s+items\b|\b\d+\s+tests?\s+collected\b", re.I)
+_UNITTEST_RAN_RE = re.compile(r"^Ran\s+(\d+)\s+tests?\s+in\s+\d", re.M)
 
 _ERROR_LINE_RE = re.compile(
     r"(Traceback \(most recent call last\)"
@@ -513,6 +563,1144 @@ def _record_guard_collision(receipt_path: pathlib.Path, receipt_data: Dict[str, 
         sys.stderr.write(f"[ag_ops] Warning: could not persist collision log to {receipt_path}: {exc}\n")
 
 
+def _find_git_root_pure(start_path: pathlib.Path) -> Optional[pathlib.Path]:
+    """Finds enclosing Git root purely via filesystem walk without spawning git."""
+    cur = start_path.resolve()
+    if cur.is_file():
+        cur = cur.parent
+    for candidate in (cur, *cur.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def _resolve_root_config_stop_dir(test_path: pathlib.Path) -> pathlib.Path:
+    """Resolves upper ancestor boundary for root_config_manifest (git root, cwd if ancestor, else test dir)."""
+    resolved = test_path.resolve()
+    start_dir = resolved if resolved.is_dir() else resolved.parent
+    git_root = _find_git_root_pure(start_dir)
+    if git_root is not None:
+        return git_root
+    cwd = pathlib.Path.cwd().resolve()
+    if cwd == start_dir or cwd in start_dir.parents:
+        return cwd
+    return start_dir
+
+
+def _collect_root_config_manifest(
+    test_path: pathlib.Path,
+    stop_dir: Optional[pathlib.Path] = None,
+) -> Tuple[pathlib.Path, Dict[str, str], List[pathlib.Path]]:
+    """
+    Seals root pytest/python bootstrap config files (including ABSENT markers)
+    from test_path.parent up to stop_dir (git root or workspace boundary).
+    Also returns existing pytest config files (including inside test_path) for addopts inspection.
+    """
+    resolved = test_path.resolve()
+    base = (stop_dir or _resolve_root_config_stop_dir(resolved)).resolve()
+
+    ancestors: List[pathlib.Path] = []
+    if not (resolved.is_dir() and resolved == base):
+        cur = resolved.parent
+        while cur == base or base in cur.parents:
+            if _is_symlink_or_junction(cur):
+                raise ValueError(f"Symlinks and junctions are forbidden in ancestor path: {cur}")
+            ancestors.append(cur)
+            if cur == base or cur.parent == cur:
+                break
+            cur = cur.parent
+
+    manifest: Dict[str, str] = {}
+    ini_paths: Set[pathlib.Path] = set()
+    for anc in ancestors:
+        for fname in _ROOT_CONFIG_FILENAMES:
+            cand = anc / fname
+            if _is_symlink_or_junction(cand):
+                raise ValueError(f"Symlinks and junctions are forbidden in root config path: {cand}")
+            rel_key = cand.relative_to(base).as_posix()
+            if cand.is_file():
+                manifest[rel_key] = _sha256_file(cand, normalize_eol=True)
+                if fname in _PYTEST_INI_CONFIG_FILENAMES:
+                    ini_paths.add(cand)
+            else:
+                manifest[rel_key] = "ABSENT"
+
+    if resolved.is_dir():
+        for fname in _PYTEST_INI_CONFIG_FILENAMES:
+            cand = resolved / fname
+            if _is_symlink_or_junction(cand):
+                raise ValueError(f"Symlinks and junctions are forbidden in config path: {cand}")
+            if cand.is_file():
+                ini_paths.add(cand)
+
+    ordered_manifest = dict(sorted(manifest.items()))
+    ordered_ini = sorted(ini_paths, key=lambda p: p.as_posix())
+    return base, ordered_manifest, ordered_ini
+
+
+def _verify_root_config_manifest(
+    saved_receipt: Dict[str, Any],
+    test_path: pathlib.Path,
+) -> Tuple[bool, List[str], List[pathlib.Path]]:
+    """
+    Verifies root_config_manifest against disk (if sealed in receipt).
+    Returns (ok, drift_changes, existing_ini_paths).
+    """
+    saved_manifest = saved_receipt.get("root_config_manifest")
+    if not isinstance(saved_manifest, dict):
+        # Legacy v2.3 receipt without root_config_manifest
+        _, _, ini_paths = _collect_root_config_manifest(test_path)
+        return True, [], ini_paths
+
+    base_str = saved_receipt.get("root_config_base")
+    base = pathlib.Path(base_str).resolve() if isinstance(base_str, str) and base_str else _resolve_root_config_stop_dir(test_path)
+    changes: List[str] = []
+    ini_set: Set[pathlib.Path] = set()
+
+    cur = test_path.resolve().parent
+    while cur == base or base in cur.parents:
+        if _is_symlink_or_junction(cur):
+            changes.append(f"SYMLINK_ANCESTOR:{cur.relative_to(base).as_posix() or '.'}")
+        if cur == base or cur.parent == cur:
+            break
+        cur = cur.parent
+
+    for rel_key, expected_val in sorted(saved_manifest.items()):
+        cand = base / rel_key
+        if _is_symlink_or_junction(cand):
+            changes.append(f"SYMLINK:{rel_key}")
+            continue
+        if expected_val == "ABSENT":
+            if cand.exists():
+                changes.append(f"ADDED:{rel_key}")
+        else:
+            if not cand.is_file():
+                changes.append(f"DELETED:{rel_key}")
+            else:
+                actual_sha = _sha256_file(cand, normalize_eol=True)
+                if actual_sha != expected_val:
+                    changes.append(f"MODIFIED:{rel_key}")
+                elif cand.name in _PYTEST_INI_CONFIG_FILENAMES:
+                    ini_set.add(cand)
+
+    if test_path.is_dir():
+        for fname in _PYTEST_INI_CONFIG_FILENAMES:
+            cand = test_path / fname
+            if cand.is_file() and not _is_symlink_or_junction(cand):
+                ini_set.add(cand)
+
+    return len(changes) == 0, changes, sorted(ini_set, key=lambda p: p.as_posix())
+
+
+def _safe_shlex_split(text: str, posix_mode: bool = True) -> List[str]:
+    if not text or not text.strip():
+        return []
+    try:
+        return shlex.split(text, posix=posix_mode)
+    except ValueError:
+        return text.split()
+
+
+def _extract_flag_values(tokens: List[str], flag: str) -> Tuple[bool, Set[str]]:
+    present = False
+    values: Set[str] = set()
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i].strip("\"'")
+        if tok == flag:
+            present = True
+            if i + 1 < len(tokens):
+                values.add(tokens[i + 1].strip("\"'"))
+                i += 2
+                continue
+        elif tok.startswith(f"{flag}="):
+            present = True
+            values.add(tok.split("=", 1)[1].strip("\"'"))
+        elif flag == "-k" and tok.startswith("-k") and not tok.startswith("--") and len(tok) > 2:
+            present = True
+            values.add(tok[2:].strip("\"'"))
+        i += 1
+    return present, values
+
+
+def _extract_addopts_tokens(cfg_path: pathlib.Path) -> Tuple[List[str], Optional[str]]:
+    """Extracts addopts tokens from pyproject.toml, pytest.ini, tox.ini, or setup.cfg."""
+    try:
+        raw_text = cfg_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return [], f"Failed to read {cfg_path.name}: {exc}"
+
+    name_low = cfg_path.name.lower()
+    if name_low == "pyproject.toml":
+        if tomllib is None:
+            return [], "tomllib unavailable (requires Python 3.11+)"
+        try:
+            data = tomllib.loads(raw_text)
+        except Exception as exc:
+            return [], f"Invalid TOML in {cfg_path.name}: {exc}"
+        ini_opts = data.get("tool", {}).get("pytest", {}).get("ini_options", {})
+        if not isinstance(ini_opts, dict):
+            return [], None
+        raw_addopts = ini_opts.get("addopts")
+        if isinstance(raw_addopts, str):
+            return _safe_shlex_split(raw_addopts, posix_mode=True), None
+        if isinstance(raw_addopts, list):
+            tokens: List[str] = []
+            for item in raw_addopts:
+                tokens.extend(_safe_shlex_split(str(item), posix_mode=True))
+            return tokens, None
+        return [], None
+
+    cp = configparser.ConfigParser(interpolation=None)
+    try:
+        cp.read_string(raw_text)
+    except configparser.Error as exc:
+        return [], f"Invalid INI in {cfg_path.name}: {exc}"
+
+    sections = ("tool:pytest", "pytest") if name_low == "setup.cfg" else ("pytest",)
+    for sec in sections:
+        if cp.has_option(sec, "addopts"):
+            raw_val = cp.get(sec, "addopts")
+            return _safe_shlex_split(raw_val, posix_mode=True), None
+    return [], None
+
+
+def _matches_forbid_addopts(tokens: List[str], forbid_patterns: List[str]) -> Optional[str]:
+    clean_tokens = [t.strip("\"'") for t in tokens]
+    for pat in forbid_patterns:
+        norm_pat = re.sub(r"\s+", " ", pat.strip())
+        if not norm_pat:
+            continue
+        collapsed_pat = norm_pat.replace(" ", "")
+        for idx, tok in enumerate(clean_tokens):
+            if tok == norm_pat or tok == collapsed_pat or tok.startswith(f"{norm_pat}="):
+                return norm_pat
+            if idx + 1 < len(clean_tokens):
+                pair_spaced = f"{tok} {clean_tokens[idx + 1]}"
+                pair_collapsed = f"{tok}{clean_tokens[idx + 1]}"
+                if pair_spaced == norm_pat or pair_collapsed == collapsed_pat:
+                    return norm_pat
+    return None
+
+
+def _inspect_pytest_addopts(
+    config_paths: List[pathlib.Path],
+    cmd_str: str,
+    forbid_addopts: List[str],
+) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """
+    Inspects addopts across pyproject.toml / pytest.ini / tox.ini / setup.cfg.
+    Blocks collection-only flags, undeclared --ignore/--ignore-glob/-k filters,
+    and user-declared --forbid-addopts tokens.
+    """
+    cmd_tokens = _safe_shlex_split(cmd_str, posix_mode=(os.name != "nt"))
+    declared_flags = {flag: _extract_flag_values(cmd_tokens, flag) for flag in _CMD_DECLARED_ADDOPTS}
+
+    for cfg_path in config_paths:
+        tokens, parse_err = _extract_addopts_tokens(cfg_path)
+        if parse_err:
+            return False, {
+                "error": f"UNSAFE_PYTEST_ADDOPTS: {parse_err}",
+                "file": str(cfg_path),
+                "token": "<parse_error>",
+            }
+        if not tokens:
+            continue
+
+        for raw_tok in tokens:
+            tok = raw_tok.strip("\"'")
+            base_opt = tok.split("=", 1)[0]
+            if base_opt in _ALWAYS_FORBIDDEN_ADDOPTS:
+                return False, {
+                    "error": f"UNSAFE_PYTEST_ADDOPTS: Forbidden addopts token '{tok}' in {cfg_path.name}.",
+                    "file": str(cfg_path),
+                    "token": tok,
+                }
+
+        for flag in _CMD_DECLARED_ADDOPTS:
+            in_addopts, addopts_vals = _extract_flag_values(tokens, flag)
+            if not in_addopts:
+                continue
+            in_cmd, cmd_vals = declared_flags[flag]
+            if not in_cmd or (addopts_vals and not addopts_vals.issubset(cmd_vals)):
+                bad_val = next(iter(sorted(addopts_vals - cmd_vals)), flag)
+                bad_tok = f"{flag} {bad_val}" if bad_val != flag else flag
+                return False, {
+                    "error": f"UNSAFE_PYTEST_ADDOPTS: Undeclared '{bad_tok}' in {cfg_path.name} addopts not present in sealed --cmd.",
+                    "file": str(cfg_path),
+                    "token": bad_tok,
+                }
+
+        matched_forbid = _matches_forbid_addopts(tokens, forbid_addopts)
+        if matched_forbid:
+            return False, {
+                "error": f"UNSAFE_PYTEST_ADDOPTS: Explicitly forbidden addopts pattern '{matched_forbid}' in {cfg_path.name}.",
+                "file": str(cfg_path),
+                "token": matched_forbid,
+            }
+
+    return True, None
+
+
+def _check_and_sanitize_env(
+    allow_passthrough: bool,
+    saved_env_policy: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, Optional[Dict[str, Any]], Optional[Dict[str, str]], Dict[str, Any]]:
+    """
+    Detects PYTEST_ADDOPTS / PYTHONSTARTUP taint in os.environ and returns sanitized env.
+    """
+    if isinstance(saved_env_policy, dict) and saved_env_policy.get("passthrough_allowed") is False and allow_passthrough:
+        return (
+            False,
+            {
+                "error": "ENV_TAINT_DETECTED: --allow-env-passthrough cannot relax sealed env_policy from witness-red.",
+                "tainted_vars": list(_TAINTED_ENV_KEYS),
+            },
+            None,
+            {"sanitized_keys": list(_TAINTED_ENV_KEYS), "passthrough_allowed": False},
+        )
+
+    tainted = [k for k in _TAINTED_ENV_KEYS if os.environ.get(k, "").strip()]
+    policy = {"sanitized_keys": list(_TAINTED_ENV_KEYS), "passthrough_allowed": allow_passthrough}
+    if tainted and not allow_passthrough:
+        return (
+            False,
+            {
+                "error": f"ENV_TAINT_DETECTED: Forbidden environment variable(s) set: {', '.join(tainted)}.",
+                "tainted_vars": tainted,
+            },
+            None,
+            policy,
+        )
+
+    clean_env = os.environ.copy()
+    if not allow_passthrough:
+        for k in _TAINTED_ENV_KEYS:
+            clean_env.pop(k, None)
+    return True, None, clean_env, policy
+
+
+def _extract_test_execution_counts(
+    cmd_str: str,
+    stdout_txt: str,
+    stderr_txt: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Extracts executed test counts from pytest or unittest output.
+    Returns None only when the command is a non-pytest/non-unittest custom runner
+    without standard test summary output.
+    """
+    combined = _ANSI_ESCAPE_RE.sub("", f"{stdout_txt}\n{stderr_txt}")
+    is_pytest_cmd = bool(re.search(r"\bpytest\b|\bpy\.test\b", cmd_str, re.I))
+    is_unittest_cmd = bool(re.search(r"\bunittest\b", cmd_str, re.I))
+
+    for line in reversed(combined.splitlines()):
+        if _PYTEST_SUMMARY_LINE_RE.search(line):
+            if "no tests ran" in line.lower():
+                return {
+                    "runner": "pytest",
+                    "total": 0,
+                    "passed": 0,
+                    "failed": 0,
+                    "error": 0,
+                    "skipped": 0,
+                    "xfailed": 0,
+                    "xpassed": 0,
+                }
+            counts: Dict[str, int] = {
+                "passed": 0,
+                "failed": 0,
+                "error": 0,
+                "skipped": 0,
+                "xfailed": 0,
+                "xpassed": 0,
+            }
+            for num_str, label in _PYTEST_COUNT_TOKEN_RE.findall(line):
+                lbl = label.lower()
+                key = "error" if lbl.startswith("error") else lbl
+                if key in counts:
+                    counts[key] += int(num_str)
+            total = (
+                counts["passed"]
+                + counts["failed"]
+                + counts["error"]
+                + counts["skipped"]
+                + counts["xfailed"]
+                + counts["xpassed"]
+            )
+            return {"runner": "pytest", "total": total, **counts}
+
+    m_unit = _UNITTEST_RAN_RE.search(combined)
+    if m_unit:
+        return {"runner": "unittest", "total": int(m_unit.group(1))}
+
+    if _PYTEST_COLLECTED_ZERO_RE.search(combined):
+        return {"runner": "pytest", "total": 0}
+    if is_pytest_cmd:
+        return {"runner": "pytest", "total": 0}
+    if is_unittest_cmd:
+        return {"runner": "unittest", "total": 0}
+    return None
+
+
+def _parse_guard_receipt(receipt_path: pathlib.Path) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Loads and validates core receipt fields for both v2.3 and v2.4 receipts."""
+    try:
+        saved_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"CORRUPTED_RECEIPT: Failed to parse {receipt_path}: {exc}"
+
+    if not isinstance(saved_receipt, dict) or saved_receipt.get("version") != 2:
+        got_ver = saved_receipt.get("version") if isinstance(saved_receipt, dict) else None
+        return None, f"CORRUPTED_RECEIPT: Unsupported or missing receipt version (expected 2, got {got_ver!r})."
+
+    saved_cmd = (saved_receipt.get("cmd") or "").strip()
+    if not saved_cmd:
+        return None, "CORRUPTED_RECEIPT: Receipt is missing a non-empty witnessed 'cmd'."
+
+    return saved_receipt, None
+
+
+def _guard_witness_red(
+    args: argparse.Namespace,
+    test_path: pathlib.Path,
+    state_dir: pathlib.Path,
+    receipt_path: pathlib.Path,
+    timeout_sec: float,
+    cli_ignore: List[str],
+    current_head_sha: Optional[str],
+) -> int:
+    cmd_str = (args.cmd or "").strip()
+    if not cmd_str:
+        return _emit({"ok": False, "error": "MISSING_CMD: --cmd is required for witness-red"}, args.json, exit_code=1)
+
+    forbid_addopts = _parse_ignore_patterns(getattr(args, "forbid_addopts", None))
+    allow_passthrough = bool(getattr(args, "allow_env_passthrough", False))
+
+    env_ok, env_err, clean_env, env_policy = _check_and_sanitize_env(allow_passthrough)
+    if not env_ok and env_err:
+        return _emit({"ok": False, **env_err}, args.json, exit_code=2)
+
+    try:
+        root_base, root_manifest, ini_paths = _collect_root_config_manifest(test_path)
+    except (ValueError, OSError) as exc:
+        return _emit({"ok": False, "error": f"GUARD_INIT_FAILED: {exc}"}, args.json, exit_code=1)
+
+    addopts_ok, addopts_err = _inspect_pytest_addopts(ini_paths, cmd_str, forbid_addopts)
+    if not addopts_ok and addopts_err:
+        return _emit({"ok": False, **addopts_err}, args.json, exit_code=2)
+
+    try:
+        pre_hash, pre_files = _compute_merkle_tree(test_path, state_dir, receipt_path, cli_ignore)
+    except (ValueError, OSError) as exc:
+        return _emit({"ok": False, "error": f"GUARD_INIT_FAILED: {exc}"}, args.json, exit_code=1)
+
+    if not pre_files:
+        return _emit(
+            {"ok": False, "error": f"EMPTY_TEST_TARGET: No files found to seal in {test_path}"},
+            args.json,
+            exit_code=1,
+        )
+
+    returncode, stdout_txt, stderr_txt, timed_out, elapsed_ms = _run_command_isolated(cmd_str, timeout_sec, env=clean_env)
+
+    if timed_out:
+        return _emit(
+            {"ok": False, "error": f"COMMAND_TIMED_OUT: Test command exceeded {timeout_sec}s during witness-red", "cmd": cmd_str},
+            args.json,
+            exit_code=1,
+        )
+
+    if returncode == 0:
+        return _emit(
+            {
+                "ok": False,
+                "error": "COOPERATIVE_TEST: Test passed before fix (exit 0). Red state was not witnessed.",
+                "cmd": cmd_str,
+                "elapsed_ms": elapsed_ms,
+            },
+            args.json,
+            exit_code=1,
+        )
+
+    expected_exit = getattr(args, "expected_exit", None)
+    if expected_exit is not None and returncode != expected_exit:
+        return _emit(
+            {
+                "ok": False,
+                "error": f"UNEXPECTED_EXIT_CODE: Expected exit code {expected_exit}, got {returncode}.",
+                "cmd": cmd_str,
+                "returncode": returncode,
+                "stderr": stderr_txt[-500:],
+            },
+            args.json,
+            exit_code=1,
+        )
+    if expected_exit is None and returncode in (2, 3, 4, 5, 126, 127, 9009):
+        return _emit(
+            {
+                "ok": False,
+                "error": f"INVALID_TEST_INVOCATION: Exit code {returncode} indicates collection, syntax, or command error rather than assertion failure. Pass --expected-exit {returncode} if intentional.",
+                "cmd": cmd_str,
+                "returncode": returncode,
+                "stderr": (stderr_txt or stdout_txt)[-500:],
+            },
+            args.json,
+            exit_code=1,
+        )
+
+    try:
+        tree_hash, files_map = _compute_merkle_tree(test_path, state_dir, receipt_path, cli_ignore)
+    except (ValueError, OSError) as exc:
+        return _emit(
+            {
+                "ok": False,
+                "error": f"SELF_MUTATING_TEST_DIR: Test execution introduced forbidden filesystem state inside test_dir: {exc}",
+            },
+            args.json,
+            exit_code=1,
+        )
+    if tree_hash != pre_hash:
+        return _emit(
+            {
+                "ok": False,
+                "error": "SELF_MUTATING_TEST_DIR: Test execution created or modified files inside test_dir.",
+                "pre_hash": pre_hash,
+                "post_hash": tree_hash,
+            },
+            args.json,
+            exit_code=1,
+        )
+
+    red_signature = _extract_red_signature(stdout_txt, stderr_txt)
+    exec_counts = _extract_test_execution_counts(cmd_str, stdout_txt, stderr_txt)
+    witnessed_test_count = exec_counts["total"] if exec_counts is not None else None
+
+    receipt: Dict[str, Any] = {
+        "version": 2,
+        "schema_version": _SCHEMA_VERSION,
+        "status": "WITNESSED_RED",
+        "timestamp_utc": _utc_now_iso(),
+        "test_target": str(test_path),
+        "cmd": cmd_str,
+        "tree_hash": tree_hash,
+        "witnessed_head_sha": current_head_sha,
+        "red_exit_code": returncode,
+        "red_signature": red_signature,
+        "witnessed_test_count": witnessed_test_count,
+        "elapsed_ms": elapsed_ms,
+        "ignored_patterns": cli_ignore,
+        "forbidden_addopts": forbid_addopts,
+        "env_policy": env_policy,
+        "root_config_base": str(root_base),
+        "root_config_manifest": root_manifest,
+        "files": files_map,
+        "renegotiation_history": [],
+        "collisions": [],
+    }
+    _atomic_write_json(receipt_path, receipt)
+
+    return _emit(
+        {
+            "ok": True,
+            "schema_version": _SCHEMA_VERSION,
+            "status": "WITNESSED_RED",
+            "tree_hash": tree_hash,
+            "witnessed_head_sha": current_head_sha,
+            "cmd": cmd_str,
+            "red_exit_code": returncode,
+            "red_signature": red_signature,
+            "witnessed_test_count": witnessed_test_count,
+            "root_config_count": len(root_manifest),
+            "files_count": len(files_map),
+            "ignored_patterns": cli_ignore,
+            "receipt_file": str(receipt_path),
+        },
+        args.json,
+        exit_code=0,
+    )
+
+
+def _guard_verify_green(
+    args: argparse.Namespace,
+    test_path: pathlib.Path,
+    state_dir: pathlib.Path,
+    receipt_path: pathlib.Path,
+    timeout_sec: float,
+    current_head_sha: Optional[str],
+) -> int:
+    if not receipt_path.is_file():
+        return _emit(
+            {"ok": False, "error": f"NO_RED_RECEIPT: No previous witnessed red receipt found at {receipt_path}"},
+            args.json,
+            exit_code=1,
+        )
+
+    saved_receipt, parse_err = _parse_guard_receipt(receipt_path)
+    if parse_err or saved_receipt is None:
+        return _emit({"ok": False, "error": parse_err or "CORRUPTED_RECEIPT"}, args.json, exit_code=2)
+
+    saved_cmd = (saved_receipt.get("cmd") or "").strip()
+    saved_target = saved_receipt.get("test_target")
+    if not saved_target or pathlib.Path(saved_target).resolve() != test_path:
+        return _emit(
+            {
+                "ok": False,
+                "error": "TARGET_MISMATCH: --test-dir does not match witnessed test_target.",
+                "witnessed_target": saved_target,
+                "attempted_target": str(test_path),
+            },
+            args.json,
+            exit_code=2,
+        )
+
+    saved_head_sha = saved_receipt.get("witnessed_head_sha")
+    if saved_head_sha and current_head_sha and saved_head_sha != current_head_sha and not getattr(args, "allow_head_move", False):
+        _record_guard_collision(
+            receipt_path,
+            saved_receipt,
+            "HEAD_MOVED_DURING_RED_PHASE",
+            {"witnessed_head_sha": saved_head_sha, "current_head_sha": current_head_sha},
+        )
+        return _emit(
+            {
+                "ok": False,
+                "error": f"HEAD_MOVED_DURING_RED_PHASE: Git HEAD moved from {saved_head_sha[:8]} to {current_head_sha[:8]} before verify-green. Local commits during Red->Green phase are prohibited unless --allow-head-move is set.",
+                "witnessed_head_sha": saved_head_sha,
+                "current_head_sha": current_head_sha,
+            },
+            args.json,
+            exit_code=2,
+        )
+
+    saved_tree_hash = saved_receipt.get("tree_hash")
+    saved_files: Dict[str, str] = saved_receipt.get("files", {})
+    if not saved_tree_hash or not isinstance(saved_files, dict) or not saved_files:
+        return _emit(
+            {"ok": False, "error": "CORRUPTED_RECEIPT: Receipt is missing tree_hash or non-empty files manifest."},
+            args.json,
+            exit_code=2,
+        )
+
+    saved_ignore = list(saved_receipt.get("ignored_patterns", []))
+    raw_cli_ignore = getattr(args, "ignore", "") or ""
+    if raw_cli_ignore.strip():
+        cli_ignore_list = _parse_ignore_patterns(raw_cli_ignore)
+        if sorted(cli_ignore_list) != sorted(saved_ignore):
+            _record_guard_collision(
+                receipt_path,
+                saved_receipt,
+                "IGNORE_PATTERN_MISMATCH",
+                {"witnessed_ignore": saved_ignore, "attempted_ignore": cli_ignore_list},
+            )
+            return _emit(
+                {
+                    "ok": False,
+                    "error": f"IGNORE_PATTERN_MISMATCH: Provided --ignore patterns {cli_ignore_list} do not match witnessed patterns {saved_ignore}.",
+                    "witnessed_ignore": saved_ignore,
+                    "attempted_ignore": cli_ignore_list,
+                },
+                args.json,
+                exit_code=2,
+            )
+
+    effective_ignore = saved_ignore
+
+    cmd_to_run = args.cmd.strip() if args.cmd else saved_cmd
+    if cmd_to_run != saved_cmd:
+        _record_guard_collision(
+            receipt_path,
+            saved_receipt,
+            "COMMAND_MISMATCH",
+            {"witnessed_cmd": saved_cmd, "attempted_cmd": cmd_to_run},
+        )
+        return _emit(
+            {
+                "ok": False,
+                "error": f"COMMAND_MISMATCH: Provided command '{cmd_to_run}' does not match witnessed command '{saved_cmd}'.",
+                "witnessed_cmd": saved_cmd,
+                "attempted_cmd": cmd_to_run,
+            },
+            args.json,
+            exit_code=2,
+        )
+
+    allow_passthrough = bool(getattr(args, "allow_env_passthrough", False))
+    env_ok, env_err, clean_env, _ = _check_and_sanitize_env(allow_passthrough, saved_receipt.get("env_policy"))
+    if not env_ok and env_err:
+        _record_guard_collision(receipt_path, saved_receipt, "ENV_TAINT_DETECTED", env_err)
+        return _emit({"ok": False, **env_err}, args.json, exit_code=2)
+
+    root_ok, root_changes, ini_paths = _verify_root_config_manifest(saved_receipt, test_path)
+    if not root_ok:
+        _record_guard_collision(receipt_path, saved_receipt, "ROOT_CONFIG_DRIFT", {"changes": root_changes})
+        return _emit(
+            {
+                "ok": False,
+                "error": "ROOT_CONFIG_DRIFT: Root test configuration changed outside --test-dir without renegotiation.",
+                "changes": root_changes,
+            },
+            args.json,
+            exit_code=2,
+        )
+
+    saved_forbid = list(saved_receipt.get("forbidden_addopts", []))
+    cli_forbid = _parse_ignore_patterns(getattr(args, "forbid_addopts", None))
+    effective_forbid = sorted(set(saved_forbid) | set(cli_forbid))
+    addopts_ok, addopts_err = _inspect_pytest_addopts(ini_paths, cmd_to_run, effective_forbid)
+    if not addopts_ok and addopts_err:
+        _record_guard_collision(receipt_path, saved_receipt, "UNSAFE_PYTEST_ADDOPTS", addopts_err)
+        return _emit({"ok": False, **addopts_err}, args.json, exit_code=2)
+
+    try:
+        current_tree_hash, current_files = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
+    except (ValueError, OSError) as exc:
+        return _emit({"ok": False, "error": f"GUARD_VERIFY_FAILED: {exc}"}, args.json, exit_code=1)
+    if not current_files:
+        return _emit(
+            {"ok": False, "error": f"EMPTY_TEST_TARGET: No files found in {test_path}"},
+            args.json,
+            exit_code=1,
+        )
+
+    if current_tree_hash != saved_tree_hash:
+        changes: List[str] = []
+        all_keys = sorted(set(saved_files.keys()) | set(current_files.keys()))
+        for k in all_keys:
+            if k not in saved_files:
+                changes.append(f"ADDED:{k}")
+            elif k not in current_files:
+                changes.append(f"DELETED:{k}")
+            elif saved_files[k] != current_files[k]:
+                changes.append(f"MODIFIED:{k}")
+
+        _record_guard_collision(
+            receipt_path,
+            saved_receipt,
+            "EACCES_TEST_TAMPERING",
+            {"current_tree_hash": current_tree_hash, "changes": changes},
+        )
+        return _emit(
+            {
+                "ok": False,
+                "error": "EACCES_TEST_TAMPERING: Test files modified during fix without renegotiation",
+                "saved_tree_hash": saved_tree_hash,
+                "current_tree_hash": current_tree_hash,
+                "changes": changes,
+            },
+            args.json,
+            exit_code=2,
+        )
+
+    returncode, stdout_txt, stderr_txt, timed_out, elapsed_ms = _run_command_isolated(cmd_to_run, timeout_sec, env=clean_env)
+
+    if timed_out:
+        _record_guard_collision(receipt_path, saved_receipt, "COMMAND_TIMED_OUT", {"timeout_sec": timeout_sec})
+        return _emit(
+            {"ok": False, "error": f"COMMAND_TIMED_OUT: Test command exceeded {timeout_sec}s", "cmd": cmd_to_run},
+            args.json,
+            exit_code=1,
+        )
+
+    if returncode != 0:
+        tail_excerpt = stderr_txt[-600:] if stderr_txt else stdout_txt[-600:]
+        _record_guard_collision(
+            receipt_path,
+            saved_receipt,
+            "TEST_STILL_FAILING",
+            {"exit_code": returncode, "stderr_tail": tail_excerpt[-250:]},
+        )
+        return _emit(
+            {
+                "ok": False,
+                "error": f"TEST_STILL_FAILING: Test exited with code {returncode}",
+                "exit_code": returncode,
+                "cmd": cmd_to_run,
+                "stderr_tail": tail_excerpt,
+            },
+            args.json,
+            exit_code=1,
+        )
+
+    witnessed_count = saved_receipt.get("witnessed_test_count")
+    exec_counts = _extract_test_execution_counts(cmd_to_run, stdout_txt, stderr_txt)
+    green_count = exec_counts["total"] if exec_counts is not None else None
+    if green_count == 0 or (isinstance(witnessed_count, int) and witnessed_count > 0 and green_count is None):
+        _record_guard_collision(
+            receipt_path,
+            saved_receipt,
+            "ZERO_TESTS_EXECUTED",
+            {"witnessed_test_count": witnessed_count, "green_test_count": green_count or 0},
+        )
+        return _emit(
+            {
+                "ok": False,
+                "error": "ZERO_TESTS_EXECUTED: Test command exited 0 but executed 0 tests.",
+                "witnessed_test_count": witnessed_count,
+                "green_test_count": green_count or 0,
+                "cmd": cmd_to_run,
+            },
+            args.json,
+            exit_code=2,
+        )
+    if isinstance(witnessed_count, int) and green_count is not None and green_count < witnessed_count:
+        _record_guard_collision(
+            receipt_path,
+            saved_receipt,
+            "TEST_COUNT_REGRESSION",
+            {"witnessed_test_count": witnessed_count, "green_test_count": green_count},
+        )
+        return _emit(
+            {
+                "ok": False,
+                "error": f"TEST_COUNT_REGRESSION: Executed {green_count} tests during verify-green, fewer than witnessed {witnessed_count}.",
+                "witnessed_test_count": witnessed_count,
+                "green_test_count": green_count,
+                "cmd": cmd_to_run,
+            },
+            args.json,
+            exit_code=2,
+        )
+
+    try:
+        post_tree_hash, _ = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
+    except (ValueError, OSError) as exc:
+        return _emit({"ok": False, "error": f"GUARD_VERIFY_FAILED: {exc}"}, args.json, exit_code=1)
+    if post_tree_hash != saved_tree_hash:
+        _record_guard_collision(
+            receipt_path,
+            saved_receipt,
+            "EACCES_TEST_TAMPERING_DURING_RUN",
+            {"post_tree_hash": post_tree_hash},
+        )
+        return _emit(
+            {
+                "ok": False,
+                "error": "EACCES_TEST_TAMPERING_DURING_RUN: Test execution mutated test files during verify-green.",
+                "saved_tree_hash": saved_tree_hash,
+                "post_tree_hash": post_tree_hash,
+            },
+            args.json,
+            exit_code=2,
+        )
+
+    post_root_ok, post_root_changes, _ = _verify_root_config_manifest(saved_receipt, test_path)
+    if not post_root_ok:
+        _record_guard_collision(
+            receipt_path,
+            saved_receipt,
+            "ROOT_CONFIG_DRIFT",
+            {"changes": post_root_changes, "phase": "post_run"},
+        )
+        return _emit(
+            {
+                "ok": False,
+                "error": "ROOT_CONFIG_DRIFT: Test execution modified root configuration files during verify-green.",
+                "changes": post_root_changes,
+            },
+            args.json,
+            exit_code=2,
+        )
+
+    saved_receipt["status"] = "VERIFIED_GREEN_WITH_MERKLE_LOCK"
+    saved_receipt["verified_at"] = _utc_now_iso()
+    saved_receipt["green_elapsed_ms"] = elapsed_ms
+    if green_count is not None:
+        saved_receipt["green_test_count"] = green_count
+    _atomic_write_json(receipt_path, saved_receipt)
+
+    return _emit(
+        {
+            "ok": True,
+            "schema_version": saved_receipt.get("schema_version", "2.3"),
+            "status": "VERIFIED_GREEN_WITH_MERKLE_LOCK",
+            "tree_hash": current_tree_hash,
+            "witnessed_head_sha": saved_head_sha,
+            "resolved_red_signature": saved_receipt.get("red_signature", []),
+            "witnessed_test_count": witnessed_count,
+            "green_test_count": green_count,
+            "cmd": cmd_to_run,
+            "elapsed_ms": elapsed_ms,
+            "collisions_count": len(saved_receipt.get("collisions", [])),
+            "receipt_file": str(receipt_path),
+        },
+        args.json,
+        exit_code=0,
+    )
+
+
+def _guard_renegotiate(
+    args: argparse.Namespace,
+    test_path: pathlib.Path,
+    state_dir: pathlib.Path,
+    receipt_path: pathlib.Path,
+    timeout_sec: float,
+    cli_ignore: List[str],
+    repo_root: Optional[pathlib.Path],
+    current_head_sha: Optional[str],
+) -> int:
+    reason = (args.reason or "").strip()
+    if not reason:
+        return _emit({"ok": False, "error": "MISSING_REASON: --reason is mandatory for test renegotiation"}, args.json, exit_code=1)
+
+    cmd_str = args.cmd.strip() if args.cmd else ""
+    history: List[Dict[str, Any]] = []
+    collisions: List[Dict[str, Any]] = []
+    old_tree_hash = None
+    old_cmd = None
+    old_head_sha = None
+    inherited_ignore: List[str] = []
+    inherited_forbid: List[str] = []
+    renegotiated_at_iso = _utc_now_iso()
+
+    if receipt_path.is_file():
+        old_data, parse_err = _parse_guard_receipt(receipt_path)
+        if parse_err or old_data is None:
+            return _emit(
+                {
+                    "ok": False,
+                    "error": f"CORRUPTED_RECEIPT: Cannot renegotiate over corrupted receipt at {receipt_path}: {parse_err}",
+                },
+                args.json,
+                exit_code=2,
+            )
+        old_cmd = (old_data.get("cmd") or "").strip()
+        old_tree_hash = old_data.get("tree_hash")
+        old_head_sha = old_data.get("witnessed_head_sha")
+        if not old_tree_hash:
+            return _emit(
+                {
+                    "ok": False,
+                    "error": f"CORRUPTED_RECEIPT: Cannot renegotiate over corrupted receipt at {receipt_path}: missing tree_hash",
+                },
+                args.json,
+                exit_code=2,
+            )
+        raw_history = old_data.get("renegotiation_history", [])
+        if not isinstance(raw_history, list):
+            return _emit(
+                {
+                    "ok": False,
+                    "error": f"CORRUPTED_RECEIPT: Cannot renegotiate over corrupted receipt at {receipt_path}: renegotiation_history must be a list",
+                },
+                args.json,
+                exit_code=2,
+            )
+        history = list(raw_history)
+        collisions = list(old_data.get("collisions", [])) if isinstance(old_data.get("collisions"), list) else []
+        inherited_ignore = list(old_data.get("ignored_patterns", []))
+        inherited_forbid = list(old_data.get("forbidden_addopts", []))
+        hist_entry: Dict[str, Any] = {
+            "timestamp": old_data.get("timestamp_utc"),
+            "renegotiated_at": renegotiated_at_iso,
+            "status": old_data.get("status"),
+            "reason": old_data.get("reason"),
+            "tree_hash": old_tree_hash,
+            "witnessed_head_sha": old_head_sha,
+            "red_signature": old_data.get("red_signature", []),
+            "witnessed_test_count": old_data.get("witnessed_test_count"),
+            "cmd": old_cmd,
+        }
+        if "constructive_witness" in old_data:
+            hist_entry["constructive_witness"] = old_data["constructive_witness"]
+        history.append(hist_entry)
+
+        if old_head_sha and current_head_sha and old_head_sha != current_head_sha and not getattr(args, "allow_head_move", False):
+            _record_guard_collision(
+                receipt_path,
+                old_data,
+                "HEAD_MOVED_DURING_RED_PHASE",
+                {"witnessed_head_sha": old_head_sha, "current_head_sha": current_head_sha},
+            )
+            return _emit(
+                {
+                    "ok": False,
+                    "error": f"HEAD_MOVED_DURING_RED_PHASE: Git HEAD moved from {old_head_sha[:8]} to {current_head_sha[:8]} before renegotiate. Forging witness commits during Red phase is prohibited.",
+                    "witnessed_head_sha": old_head_sha,
+                    "current_head_sha": current_head_sha,
+                },
+                args.json,
+                exit_code=2,
+            )
+
+    effective_ignore = cli_ignore if cli_ignore else inherited_ignore
+    cli_forbid = _parse_ignore_patterns(getattr(args, "forbid_addopts", None))
+    effective_forbid = sorted(set(inherited_forbid) | set(cli_forbid))
+    pinned_sha_for_witness = old_head_sha or current_head_sha
+
+    if not cmd_str:
+        cmd_str = old_cmd or ""
+    if not cmd_str:
+        return _emit({"ok": False, "error": "MISSING_CMD: Test command is required for renegotiate"}, args.json, exit_code=1)
+
+    allow_passthrough = bool(getattr(args, "allow_env_passthrough", False))
+    env_ok, env_err, clean_env, env_policy = _check_and_sanitize_env(allow_passthrough)
+    if not env_ok and env_err:
+        return _emit({"ok": False, **env_err}, args.json, exit_code=2)
+
+    try:
+        root_base, root_manifest, ini_paths = _collect_root_config_manifest(test_path)
+    except (ValueError, OSError) as exc:
+        return _emit({"ok": False, "error": f"GUARD_RENEGOTIATE_FAILED: {exc}"}, args.json, exit_code=1)
+
+    addopts_ok, addopts_err = _inspect_pytest_addopts(ini_paths, cmd_str, effective_forbid)
+    if not addopts_ok and addopts_err:
+        return _emit({"ok": False, **addopts_err}, args.json, exit_code=2)
+
+    try:
+        pre_hash, pre_files = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
+    except (ValueError, OSError) as exc:
+        return _emit({"ok": False, "error": f"GUARD_RENEGOTIATE_FAILED: {exc}"}, args.json, exit_code=1)
+    if not pre_files:
+        return _emit(
+            {"ok": False, "error": f"EMPTY_TEST_TARGET: No files found to seal in {test_path}"},
+            args.json,
+            exit_code=1,
+        )
+
+    returncode, stdout_txt, stderr_txt, timed_out, elapsed_ms = _run_command_isolated(cmd_str, timeout_sec, env=clean_env)
+
+    if timed_out:
+        return _emit(
+            {"ok": False, "error": f"COMMAND_TIMED_OUT: Test command exceeded {timeout_sec}s during renegotiate", "cmd": cmd_str},
+            args.json,
+            exit_code=1,
+        )
+
+    if returncode == 0:
+        return _emit(
+            {
+                "ok": False,
+                "error": "COOPERATIVE_RENEGOTIATION: Newly renegotiated test passed immediately (exit 0). It must fail against clean code to be witnessed.",
+                "cmd": cmd_str,
+            },
+            args.json,
+            exit_code=1,
+        )
+
+    expected_exit = getattr(args, "expected_exit", None)
+    if expected_exit is not None and returncode != expected_exit:
+        return _emit(
+            {
+                "ok": False,
+                "error": f"UNEXPECTED_EXIT_CODE: Expected exit code {expected_exit}, got {returncode}.",
+                "cmd": cmd_str,
+                "returncode": returncode,
+            },
+            args.json,
+            exit_code=1,
+        )
+    if expected_exit is None and returncode in (2, 3, 4, 5, 126, 127, 9009):
+        return _emit(
+            {
+                "ok": False,
+                "error": f"INVALID_TEST_INVOCATION: Exit code {returncode} indicates collection, syntax, or command error rather than assertion failure.",
+                "cmd": cmd_str,
+                "returncode": returncode,
+                "stderr": (stderr_txt or stdout_txt)[-500:],
+            },
+            args.json,
+            exit_code=1,
+        )
+
+    witness_ok, witness_err, witness_proof = _verify_constructive_witness(
+        args,
+        stdout_txt,
+        stderr_txt,
+        repo_root=repo_root,
+        pinned_sha=pinned_sha_for_witness,
+    )
+    if not witness_ok:
+        if receipt_path.is_file():
+            try:
+                existing_rec = json.loads(receipt_path.read_text(encoding="utf-8"))
+                if isinstance(existing_rec, dict):
+                    _record_guard_collision(
+                        receipt_path,
+                        existing_rec,
+                        "INVALID_CONSTRUCTIVE_WITNESS",
+                        {"reason": witness_err},
+                    )
+            except (OSError, json.JSONDecodeError) as exc:
+                sys.stderr.write(f"[ag_ops] Warning: failed to log witness collision: {exc}\n")
+        return _emit({"ok": False, "error": witness_err}, args.json, exit_code=1)
+
+    try:
+        tree_hash, files_map = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
+    except (ValueError, OSError) as exc:
+        return _emit(
+            {
+                "ok": False,
+                "error": f"SELF_MUTATING_TEST_DIR: Test execution introduced forbidden filesystem state during renegotiate: {exc}",
+            },
+            args.json,
+            exit_code=1,
+        )
+    if tree_hash != pre_hash:
+        return _emit(
+            {
+                "ok": False,
+                "error": "SELF_MUTATING_TEST_DIR: Test execution modified files inside test_dir during renegotiate.",
+            },
+            args.json,
+            exit_code=1,
+        )
+
+    red_signature = _extract_red_signature(stdout_txt, stderr_txt)
+    exec_counts = _extract_test_execution_counts(cmd_str, stdout_txt, stderr_txt)
+    witnessed_test_count = exec_counts["total"] if exec_counts is not None else None
+
+    new_receipt: Dict[str, Any] = {
+        "version": 2,
+        "schema_version": _SCHEMA_VERSION,
+        "status": "RENEGOTIATED_RED",
+        "timestamp_utc": renegotiated_at_iso,
+        "test_target": str(test_path),
+        "reason": reason,
+        "cmd": cmd_str,
+        "tree_hash": tree_hash,
+        "previous_tree_hash": old_tree_hash,
+        "witnessed_head_sha": pinned_sha_for_witness,
+        "red_exit_code": returncode,
+        "red_signature": red_signature,
+        "witnessed_test_count": witnessed_test_count,
+        "elapsed_ms": elapsed_ms,
+        "ignored_patterns": effective_ignore,
+        "forbidden_addopts": effective_forbid,
+        "env_policy": env_policy,
+        "root_config_base": str(root_base),
+        "root_config_manifest": root_manifest,
+        "files": files_map,
+        "renegotiation_history": history,
+        "collisions": collisions,
+    }
+    if witness_proof is not None:
+        new_receipt["constructive_witness"] = witness_proof
+
+    _atomic_write_json(receipt_path, new_receipt)
+
+    return _emit(
+        {
+            "ok": True,
+            "schema_version": _SCHEMA_VERSION,
+            "status": "RENEGOTIATED_RED",
+            "reason": reason,
+            "new_tree_hash": tree_hash,
+            "previous_tree_hash": old_tree_hash,
+            "witnessed_head_sha": pinned_sha_for_witness,
+            "cmd": cmd_str,
+            "red_exit_code": returncode,
+            "red_signature": red_signature,
+            "witnessed_test_count": witnessed_test_count,
+            "history_count": len(history),
+            "constructive_witness": witness_proof,
+            "receipt_file": str(receipt_path),
+        },
+        args.json,
+        exit_code=0,
+    )
+
+
 def _cmd_guard(args: argparse.Namespace) -> int:
     action = args.guard_action
     raw_target = pathlib.Path(args.test_dir)
@@ -538,586 +1726,11 @@ def _cmd_guard(args: argparse.Namespace) -> int:
     repo_root, current_head_sha = _get_git_repo_and_head(test_path)
 
     if action == "witness-red":
-        cmd_str = args.cmd.strip()
-        if not cmd_str:
-            return _emit({"ok": False, "error": "MISSING_CMD: --cmd is required for witness-red"}, args.json, exit_code=1)
-
-        try:
-            pre_hash, pre_files = _compute_merkle_tree(test_path, state_dir, receipt_path, cli_ignore)
-        except (ValueError, OSError) as exc:
-            return _emit({"ok": False, "error": f"GUARD_INIT_FAILED: {exc}"}, args.json, exit_code=1)
-
-        if not pre_files:
-            return _emit(
-                {"ok": False, "error": f"EMPTY_TEST_TARGET: No files found to seal in {test_path}"},
-                args.json,
-                exit_code=1,
-            )
-
-        returncode, stdout_txt, stderr_txt, timed_out, elapsed_ms = _run_command_isolated(cmd_str, timeout_sec)
-
-        if timed_out:
-            return _emit(
-                {"ok": False, "error": f"COMMAND_TIMED_OUT: Test command exceeded {timeout_sec}s during witness-red", "cmd": cmd_str},
-                args.json,
-                exit_code=1,
-            )
-
-        if returncode == 0:
-            return _emit(
-                {
-                    "ok": False,
-                    "error": "COOPERATIVE_TEST: Test passed before fix (exit 0). Red state was not witnessed.",
-                    "cmd": cmd_str,
-                    "elapsed_ms": elapsed_ms,
-                },
-                args.json,
-                exit_code=1,
-            )
-
-        expected_exit = getattr(args, "expected_exit", None)
-        if expected_exit is not None and returncode != expected_exit:
-            return _emit(
-                {
-                    "ok": False,
-                    "error": f"UNEXPECTED_EXIT_CODE: Expected exit code {expected_exit}, got {returncode}.",
-                    "cmd": cmd_str,
-                    "returncode": returncode,
-                    "stderr": stderr_txt[-500:],
-                },
-                args.json,
-                exit_code=1,
-            )
-        elif expected_exit is None and returncode in (2, 3, 4, 5, 126, 127, 9009):
-            return _emit(
-                {
-                    "ok": False,
-                    "error": f"INVALID_TEST_INVOCATION: Exit code {returncode} indicates collection, syntax, or command error rather than assertion failure. Pass --expected-exit {returncode} if intentional.",
-                    "cmd": cmd_str,
-                    "returncode": returncode,
-                    "stderr": (stderr_txt or stdout_txt)[-500:],
-                },
-                args.json,
-                exit_code=1,
-            )
-
-        try:
-            tree_hash, files_map = _compute_merkle_tree(test_path, state_dir, receipt_path, cli_ignore)
-        except (ValueError, OSError) as exc:
-            return _emit(
-                {
-                    "ok": False,
-                    "error": f"SELF_MUTATING_TEST_DIR: Test execution introduced forbidden filesystem state inside test_dir: {exc}",
-                },
-                args.json,
-                exit_code=1,
-            )
-        if tree_hash != pre_hash:
-            return _emit(
-                {
-                    "ok": False,
-                    "error": "SELF_MUTATING_TEST_DIR: Test execution created or modified files inside test_dir.",
-                    "pre_hash": pre_hash,
-                    "post_hash": tree_hash,
-                },
-                args.json,
-                exit_code=1,
-            )
-
-        red_signature = _extract_red_signature(stdout_txt, stderr_txt)
-
-        receipt = {
-            "version": 2,
-            "status": "WITNESSED_RED",
-            "timestamp_utc": _utc_now_iso(),
-            "test_target": str(test_path),
-            "cmd": cmd_str,
-            "tree_hash": tree_hash,
-            "witnessed_head_sha": current_head_sha,
-            "red_exit_code": returncode,
-            "red_signature": red_signature,
-            "elapsed_ms": elapsed_ms,
-            "ignored_patterns": cli_ignore,
-            "files": files_map,
-            "renegotiation_history": [],
-            "collisions": [],
-        }
-        _atomic_write_json(receipt_path, receipt)
-
-        return _emit(
-            {
-                "ok": True,
-                "status": "WITNESSED_RED",
-                "tree_hash": tree_hash,
-                "witnessed_head_sha": current_head_sha,
-                "cmd": cmd_str,
-                "red_exit_code": returncode,
-                "red_signature": red_signature,
-                "files_count": len(files_map),
-                "ignored_patterns": cli_ignore,
-                "receipt_file": str(receipt_path),
-            },
-            args.json,
-            exit_code=0,
-        )
-
-    elif action == "verify-green":
-        if not receipt_path.is_file():
-            return _emit(
-                {"ok": False, "error": f"NO_RED_RECEIPT: No previous witnessed red receipt found at {receipt_path}"},
-                args.json,
-                exit_code=1,
-            )
-
-        try:
-            saved_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            return _emit(
-                {"ok": False, "error": f"CORRUPTED_RECEIPT: Failed to parse {receipt_path}: {exc}"},
-                args.json,
-                exit_code=2,
-            )
-
-        if not isinstance(saved_receipt, dict) or saved_receipt.get("version") != 2:
-            return _emit(
-                {
-                    "ok": False,
-                    "error": f"CORRUPTED_RECEIPT: Unsupported or missing receipt version (expected 2, got {saved_receipt.get('version') if isinstance(saved_receipt, dict) else None!r}).",
-                },
-                args.json,
-                exit_code=2,
-            )
-
-        saved_cmd = (saved_receipt.get("cmd") or "").strip()
-        if not saved_cmd:
-            return _emit(
-                {"ok": False, "error": "CORRUPTED_RECEIPT: Receipt is missing a non-empty witnessed 'cmd'."},
-                args.json,
-                exit_code=2,
-            )
-
-        saved_target = saved_receipt.get("test_target")
-        if not saved_target or pathlib.Path(saved_target).resolve() != test_path:
-            return _emit(
-                {
-                    "ok": False,
-                    "error": "TARGET_MISMATCH: --test-dir does not match witnessed test_target.",
-                    "witnessed_target": saved_target,
-                    "attempted_target": str(test_path),
-                },
-                args.json,
-                exit_code=2,
-            )
-
-        saved_head_sha = saved_receipt.get("witnessed_head_sha")
-        if saved_head_sha and current_head_sha and saved_head_sha != current_head_sha and not getattr(args, "allow_head_move", False):
-            _record_guard_collision(
-                receipt_path,
-                saved_receipt,
-                "HEAD_MOVED_DURING_RED_PHASE",
-                {"witnessed_head_sha": saved_head_sha, "current_head_sha": current_head_sha},
-            )
-            return _emit(
-                {
-                    "ok": False,
-                    "error": f"HEAD_MOVED_DURING_RED_PHASE: Git HEAD moved from {saved_head_sha[:8]} to {current_head_sha[:8]} before verify-green. Local commits during Red->Green phase are prohibited unless --allow-head-move is set.",
-                    "witnessed_head_sha": saved_head_sha,
-                    "current_head_sha": current_head_sha,
-                },
-                args.json,
-                exit_code=2,
-            )
-
-        saved_tree_hash = saved_receipt.get("tree_hash")
-        saved_files: Dict[str, str] = saved_receipt.get("files", {})
-        if not saved_tree_hash or not isinstance(saved_files, dict) or not saved_files:
-            return _emit(
-                {"ok": False, "error": "CORRUPTED_RECEIPT: Receipt is missing tree_hash or non-empty files manifest."},
-                args.json,
-                exit_code=2,
-            )
-
-        saved_ignore = list(saved_receipt.get("ignored_patterns", []))
-        raw_cli_ignore = getattr(args, "ignore", "") or ""
-        if raw_cli_ignore.strip():
-            cli_ignore_list = _parse_ignore_patterns(raw_cli_ignore)
-            if sorted(cli_ignore_list) != sorted(saved_ignore):
-                _record_guard_collision(
-                    receipt_path,
-                    saved_receipt,
-                    "IGNORE_PATTERN_MISMATCH",
-                    {"witnessed_ignore": saved_ignore, "attempted_ignore": cli_ignore_list},
-                )
-                return _emit(
-                    {
-                        "ok": False,
-                        "error": f"IGNORE_PATTERN_MISMATCH: Provided --ignore patterns {cli_ignore_list} do not match witnessed patterns {saved_ignore}.",
-                        "witnessed_ignore": saved_ignore,
-                        "attempted_ignore": cli_ignore_list,
-                    },
-                    args.json,
-                    exit_code=2,
-                )
-
-        effective_ignore = saved_ignore
-
-        cmd_to_run = args.cmd.strip() if args.cmd else saved_cmd
-        if cmd_to_run != saved_cmd:
-            _record_guard_collision(
-                receipt_path,
-                saved_receipt,
-                "COMMAND_MISMATCH",
-                {"witnessed_cmd": saved_cmd, "attempted_cmd": cmd_to_run},
-            )
-            return _emit(
-                {
-                    "ok": False,
-                    "error": f"COMMAND_MISMATCH: Provided command '{cmd_to_run}' does not match witnessed command '{saved_cmd}'.",
-                    "witnessed_cmd": saved_cmd,
-                    "attempted_cmd": cmd_to_run,
-                },
-                args.json,
-                exit_code=2,
-            )
-
-        try:
-            current_tree_hash, current_files = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
-        except (ValueError, OSError) as exc:
-            return _emit({"ok": False, "error": f"GUARD_VERIFY_FAILED: {exc}"}, args.json, exit_code=1)
-        if not current_files:
-            return _emit(
-                {"ok": False, "error": f"EMPTY_TEST_TARGET: No files found in {test_path}"},
-                args.json,
-                exit_code=1,
-            )
-
-        if current_tree_hash != saved_tree_hash:
-            changes: List[str] = []
-            all_keys = sorted(set(saved_files.keys()) | set(current_files.keys()))
-            for k in all_keys:
-                if k not in saved_files:
-                    changes.append(f"ADDED:{k}")
-                elif k not in current_files:
-                    changes.append(f"DELETED:{k}")
-                elif saved_files[k] != current_files[k]:
-                    changes.append(f"MODIFIED:{k}")
-
-            _record_guard_collision(
-                receipt_path,
-                saved_receipt,
-                "EACCES_TEST_TAMPERING",
-                {"current_tree_hash": current_tree_hash, "changes": changes},
-            )
-            return _emit(
-                {
-                    "ok": False,
-                    "error": "EACCES_TEST_TAMPERING: Test files modified during fix without renegotiation",
-                    "saved_tree_hash": saved_tree_hash,
-                    "current_tree_hash": current_tree_hash,
-                    "changes": changes,
-                },
-                args.json,
-                exit_code=2,
-            )
-
-        returncode, stdout_txt, stderr_txt, timed_out, elapsed_ms = _run_command_isolated(cmd_to_run, timeout_sec)
-
-        if timed_out:
-            _record_guard_collision(receipt_path, saved_receipt, "COMMAND_TIMED_OUT", {"timeout_sec": timeout_sec})
-            return _emit(
-                {"ok": False, "error": f"COMMAND_TIMED_OUT: Test command exceeded {timeout_sec}s", "cmd": cmd_to_run},
-                args.json,
-                exit_code=1,
-            )
-
-        if returncode != 0:
-            tail_excerpt = stderr_txt[-600:] if stderr_txt else stdout_txt[-600:]
-            _record_guard_collision(
-                receipt_path,
-                saved_receipt,
-                "TEST_STILL_FAILING",
-                {"exit_code": returncode, "stderr_tail": tail_excerpt[-250:]},
-            )
-            return _emit(
-                {
-                    "ok": False,
-                    "error": f"TEST_STILL_FAILING: Test exited with code {returncode}",
-                    "exit_code": returncode,
-                    "cmd": cmd_to_run,
-                    "stderr_tail": tail_excerpt,
-                },
-                args.json,
-                exit_code=1,
-            )
-
-        try:
-            post_tree_hash, _ = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
-        except (ValueError, OSError) as exc:
-            return _emit({"ok": False, "error": f"GUARD_VERIFY_FAILED: {exc}"}, args.json, exit_code=1)
-        if post_tree_hash != saved_tree_hash:
-            _record_guard_collision(
-                receipt_path,
-                saved_receipt,
-                "EACCES_TEST_TAMPERING_DURING_RUN",
-                {"post_tree_hash": post_tree_hash},
-            )
-            return _emit(
-                {
-                    "ok": False,
-                    "error": "EACCES_TEST_TAMPERING_DURING_RUN: Test execution mutated test files during verify-green.",
-                    "saved_tree_hash": saved_tree_hash,
-                    "post_tree_hash": post_tree_hash,
-                },
-                args.json,
-                exit_code=2,
-            )
-
-        saved_receipt["status"] = "VERIFIED_GREEN_WITH_MERKLE_LOCK"
-        saved_receipt["verified_at"] = _utc_now_iso()
-        saved_receipt["green_elapsed_ms"] = elapsed_ms
-        _atomic_write_json(receipt_path, saved_receipt)
-
-        return _emit(
-            {
-                "ok": True,
-                "status": "VERIFIED_GREEN_WITH_MERKLE_LOCK",
-                "tree_hash": current_tree_hash,
-                "witnessed_head_sha": saved_head_sha,
-                "resolved_red_signature": saved_receipt.get("red_signature", []),
-                "cmd": cmd_to_run,
-                "elapsed_ms": elapsed_ms,
-                "collisions_count": len(saved_receipt.get("collisions", [])),
-                "receipt_file": str(receipt_path),
-            },
-            args.json,
-            exit_code=0,
-        )
-
-    elif action == "renegotiate":
-        reason = (args.reason or "").strip()
-        if not reason:
-            return _emit({"ok": False, "error": "MISSING_REASON: --reason is mandatory for test renegotiation"}, args.json, exit_code=1)
-
-        cmd_str = args.cmd.strip() if args.cmd else ""
-        history: List[Dict[str, Any]] = []
-        collisions: List[Dict[str, Any]] = []
-        old_tree_hash = None
-        old_cmd = None
-        old_head_sha = None
-        inherited_ignore: List[str] = []
-        renegotiated_at_iso = _utc_now_iso()
-
-        if receipt_path.is_file():
-            try:
-                old_data = json.loads(receipt_path.read_text(encoding="utf-8"))
-                if not isinstance(old_data, dict) or old_data.get("version") != 2:
-                    raise ValueError("Receipt version must be 2")
-                old_cmd = (old_data.get("cmd") or "").strip()
-                old_tree_hash = old_data.get("tree_hash")
-                old_head_sha = old_data.get("witnessed_head_sha")
-                if not old_cmd or not old_tree_hash:
-                    raise ValueError("Receipt missing required 'cmd' or 'tree_hash'")
-                raw_history = old_data.get("renegotiation_history", [])
-                if not isinstance(raw_history, list):
-                    raise ValueError("renegotiation_history must be a list")
-                history = list(raw_history)
-                collisions = list(old_data.get("collisions", [])) if isinstance(old_data.get("collisions"), list) else []
-                inherited_ignore = list(old_data.get("ignored_patterns", []))
-                hist_entry: Dict[str, Any] = {
-                    "timestamp": old_data.get("timestamp_utc"),
-                    "renegotiated_at": renegotiated_at_iso,
-                    "status": old_data.get("status"),
-                    "reason": old_data.get("reason"),
-                    "tree_hash": old_tree_hash,
-                    "witnessed_head_sha": old_head_sha,
-                    "red_signature": old_data.get("red_signature", []),
-                    "cmd": old_cmd,
-                }
-                if "constructive_witness" in old_data:
-                    hist_entry["constructive_witness"] = old_data["constructive_witness"]
-                history.append(hist_entry)
-            except Exception as exc:
-                return _emit(
-                    {
-                        "ok": False,
-                        "error": f"CORRUPTED_RECEIPT: Cannot renegotiate over corrupted receipt at {receipt_path}: {exc}",
-                    },
-                    args.json,
-                    exit_code=2,
-                )
-
-            if old_head_sha and current_head_sha and old_head_sha != current_head_sha and not getattr(args, "allow_head_move", False):
-                _record_guard_collision(
-                    receipt_path,
-                    old_data,
-                    "HEAD_MOVED_DURING_RED_PHASE",
-                    {"witnessed_head_sha": old_head_sha, "current_head_sha": current_head_sha},
-                )
-                return _emit(
-                    {
-                        "ok": False,
-                        "error": f"HEAD_MOVED_DURING_RED_PHASE: Git HEAD moved from {old_head_sha[:8]} to {current_head_sha[:8]} before renegotiate. Forging witness commits during Red phase is prohibited.",
-                        "witnessed_head_sha": old_head_sha,
-                        "current_head_sha": current_head_sha,
-                    },
-                    args.json,
-                    exit_code=2,
-                )
-
-        effective_ignore = cli_ignore if cli_ignore else inherited_ignore
-        pinned_sha_for_witness = old_head_sha or current_head_sha
-
-        if not cmd_str:
-            cmd_str = old_cmd or ""
-        if not cmd_str:
-            return _emit({"ok": False, "error": "MISSING_CMD: Test command is required for renegotiate"}, args.json, exit_code=1)
-
-        try:
-            pre_hash, pre_files = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
-        except (ValueError, OSError) as exc:
-            return _emit({"ok": False, "error": f"GUARD_RENEGOTIATE_FAILED: {exc}"}, args.json, exit_code=1)
-        if not pre_files:
-            return _emit(
-                {"ok": False, "error": f"EMPTY_TEST_TARGET: No files found to seal in {test_path}"},
-                args.json,
-                exit_code=1,
-            )
-
-        returncode, stdout_txt, stderr_txt, timed_out, elapsed_ms = _run_command_isolated(cmd_str, timeout_sec)
-
-        if timed_out:
-            return _emit(
-                {"ok": False, "error": f"COMMAND_TIMED_OUT: Test command exceeded {timeout_sec}s during renegotiate", "cmd": cmd_str},
-                args.json,
-                exit_code=1,
-            )
-
-        if returncode == 0:
-            return _emit(
-                {
-                    "ok": False,
-                    "error": "COOPERATIVE_RENEGOTIATION: Newly renegotiated test passed immediately (exit 0). It must fail against clean code to be witnessed.",
-                    "cmd": cmd_str,
-                },
-                args.json,
-                exit_code=1,
-            )
-
-        expected_exit = getattr(args, "expected_exit", None)
-        if expected_exit is not None and returncode != expected_exit:
-            return _emit(
-                {
-                    "ok": False,
-                    "error": f"UNEXPECTED_EXIT_CODE: Expected exit code {expected_exit}, got {returncode}.",
-                    "cmd": cmd_str,
-                    "returncode": returncode,
-                },
-                args.json,
-                exit_code=1,
-            )
-        elif expected_exit is None and returncode in (2, 3, 4, 5, 126, 127, 9009):
-            return _emit(
-                {
-                    "ok": False,
-                    "error": f"INVALID_TEST_INVOCATION: Exit code {returncode} indicates collection, syntax, or command error rather than assertion failure.",
-                    "cmd": cmd_str,
-                    "returncode": returncode,
-                    "stderr": (stderr_txt or stdout_txt)[-500:],
-                },
-                args.json,
-                exit_code=1,
-            )
-
-        witness_ok, witness_err, witness_proof = _verify_constructive_witness(
-            args,
-            stdout_txt,
-            stderr_txt,
-            repo_root=repo_root,
-            pinned_sha=pinned_sha_for_witness,
-        )
-        if not witness_ok:
-            if receipt_path.is_file():
-                try:
-                    existing_rec = json.loads(receipt_path.read_text(encoding="utf-8"))
-                    if isinstance(existing_rec, dict):
-                        _record_guard_collision(
-                            receipt_path,
-                            existing_rec,
-                            "INVALID_CONSTRUCTIVE_WITNESS",
-                            {"reason": witness_err},
-                        )
-                except (OSError, json.JSONDecodeError) as exc:
-                    sys.stderr.write(f"[ag_ops] Warning: failed to log witness collision: {exc}\n")
-            return _emit(
-                {"ok": False, "error": witness_err},
-                args.json,
-                exit_code=1,
-            )
-
-        try:
-            tree_hash, files_map = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
-        except (ValueError, OSError) as exc:
-            return _emit(
-                {
-                    "ok": False,
-                    "error": f"SELF_MUTATING_TEST_DIR: Test execution introduced forbidden filesystem state during renegotiate: {exc}",
-                },
-                args.json,
-                exit_code=1,
-            )
-        if tree_hash != pre_hash:
-            return _emit(
-                {
-                    "ok": False,
-                    "error": "SELF_MUTATING_TEST_DIR: Test execution modified files inside test_dir during renegotiate.",
-                },
-                args.json,
-                exit_code=1,
-            )
-
-        red_signature = _extract_red_signature(stdout_txt, stderr_txt)
-
-        new_receipt: Dict[str, Any] = {
-            "version": 2,
-            "status": "RENEGOTIATED_RED",
-            "timestamp_utc": renegotiated_at_iso,
-            "test_target": str(test_path),
-            "reason": reason,
-            "cmd": cmd_str,
-            "tree_hash": tree_hash,
-            "previous_tree_hash": old_tree_hash,
-            "witnessed_head_sha": pinned_sha_for_witness,
-            "red_exit_code": returncode,
-            "red_signature": red_signature,
-            "elapsed_ms": elapsed_ms,
-            "ignored_patterns": effective_ignore,
-            "files": files_map,
-            "renegotiation_history": history,
-            "collisions": collisions,
-        }
-        if witness_proof is not None:
-            new_receipt["constructive_witness"] = witness_proof
-
-        _atomic_write_json(receipt_path, new_receipt)
-
-        return _emit(
-            {
-                "ok": True,
-                "status": "RENEGOTIATED_RED",
-                "reason": reason,
-                "new_tree_hash": tree_hash,
-                "previous_tree_hash": old_tree_hash,
-                "witnessed_head_sha": pinned_sha_for_witness,
-                "cmd": cmd_str,
-                "red_exit_code": returncode,
-                "red_signature": red_signature,
-                "history_count": len(history),
-                "constructive_witness": witness_proof,
-                "receipt_file": str(receipt_path),
-            },
-            args.json,
-            exit_code=0,
-        )
+        return _guard_witness_red(args, test_path, state_dir, receipt_path, timeout_sec, cli_ignore, current_head_sha)
+    if action == "verify-green":
+        return _guard_verify_green(args, test_path, state_dir, receipt_path, timeout_sec, current_head_sha)
+    if action == "renegotiate":
+        return _guard_renegotiate(args, test_path, state_dir, receipt_path, timeout_sec, cli_ignore, repo_root, current_head_sha)
 
     return _emit({"ok": False, "error": f"UNKNOWN_GUARD_ACTION: {action}"}, args.json, exit_code=1)
 
@@ -2361,6 +2974,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_guard.add_argument("--fork-options", default="", help="Pipe-separated 'OptionA@file:line|OptionB@file:line' for arch-fork.")
     p_guard.add_argument("--expected-exit", type=int, default=None, help="Expected exit code for witness-red/renegotiate.")
     p_guard.add_argument("--allow-head-move", action="store_true", help="Allow Git HEAD to differ from witnessed_head_sha during verify-green/renegotiate.")
+    p_guard.add_argument("--forbid-addopts", default="", help="Comma-separated addopts flags/patterns to forbid in pytest configs (e.g. '-p no:cov,-p no:assertion').")
+    p_guard.add_argument("--allow-env-passthrough", action="store_true", help="Allow tainted environment variables (e.g. PYTEST_ADDOPTS) and record in receipt.")
     p_guard.add_argument("--timeout", type=float, default=120.0, help="Test execution timeout in seconds.")
     p_guard.add_argument("--json", action="store_true", help="Emit deterministic JSON.")
 
