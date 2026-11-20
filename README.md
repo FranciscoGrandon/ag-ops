@@ -184,13 +184,13 @@ test_ag_ops_v2.py (unittest)      (11 OK)      — suite raíz de auditoría
 
 | Operación / Subcomando | v2.3 (mediana) | v2.4 (mediana) | Mejora |
 | :--- | :---: | :---: | :---: |
-| `ast-lint` archivo único frío (`--no-cache`) | 2.837 ms | 1.705 ms | **1.66x** |
-| `ast-lint` archivo único caliente (`stat_cache.json`) | 2.744 ms | 1.266 ms | **2.17x** |
-| `ast-lint` repositorio completo frío (`--no-cache`) | 240.813 ms | 171.552 ms | **1.40x** |
-| `ast-lint` repositorio completo caliente (`stat_cache.json`) | 239.853 ms | 2.140 ms | **112.08x** |
-| `guard verify-green` (suite 15 tests) | 206.677 ms | 11.573 ms | **17.86x** |
-| `regret-mine` (12 commits, 3 módulos) | 7001.874 ms | 339.483 ms | **20.62x** |
-| `state status --strict` | 1.594 ms | 1.026 ms | **1.55x** |
+| `ast-lint` archivo único frío (`--no-cache`) | 2.939 ms | 1.470 ms | **2.00x** |
+| `ast-lint` archivo único caliente (`stat_cache.json`) | 2.810 ms | 1.431 ms | **1.96x** |
+| `ast-lint` repositorio completo frío (`--no-cache`) | 253.459 ms | 174.842 ms | **1.45x** |
+| `ast-lint` repositorio completo caliente (`stat_cache.json`) | 240.141 ms | 2.016 ms | **119.12x** |
+| `guard verify-green` (suite 15 tests) | 196.585 ms | 11.413 ms | **17.22x** |
+| `regret-mine` (12 commits, 3 módulos) | 7049.246 ms | 341.970 ms | **20.61x** |
+| `state status --strict` | 1.653 ms | 1.419 ms | **1.16x** |
 
 ### 3.4 Benchmark Adversarial de Fallos de Agentes (36 Escenarios — `benchmark_agent_failures.py`)
 
