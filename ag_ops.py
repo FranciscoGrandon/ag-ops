@@ -1157,6 +1157,14 @@ def _check_specs_modified_since_base(
     return sorted(modified)
 
 
+def _normalize_repo_relpath(raw_path: str) -> str:
+    """Strips redundant leading `./` and `/` segments without altering dot-folders such as `.gemini/`."""
+    norm = raw_path.strip().replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm.lstrip("/")
+
+
 def _compute_working_tree_hash(
     repo_root: Optional[pathlib.Path],
     fallback_map: Dict[str, str],
@@ -1200,7 +1208,7 @@ def _compute_working_tree_hash(
                     rel_raw = rel_raw.split(" -> ", 1)[1]
                 if rel_raw.startswith('"') and rel_raw.endswith('"'):
                     rel_raw = rel_raw[1:-1]
-                norm_rel = rel_raw.replace("\\", "/").lstrip("./")
+                norm_rel = _normalize_repo_relpath(rel_raw)
                 parts = norm_rel.split("/")
                 if any(part in ignored_parts for part in parts) or norm_rel.startswith("logs/"):
                     continue
@@ -2181,9 +2189,9 @@ def _guard_check_scope(args: argparse.Namespace) -> int:
     base_ref = (getattr(args, "base", None) or "origin/main").strip()
     raw_rule_paths = getattr(args, "rule_paths", "") or ""
     rule_patterns = [
-        p.strip().replace("\\", "/").strip("/")
+        cleaned
         for p in raw_rule_paths.split(",")
-        if p.strip()
+        if (cleaned := _normalize_repo_relpath(p).rstrip("/"))
     ]
 
     git_bin = _resolve_git_binary()
@@ -2202,7 +2210,7 @@ def _guard_check_scope(args: argparse.Namespace) -> int:
             exit_code=1,
         )
 
-    changed_files = [ln.strip().replace("\\", "/").lstrip("./") for ln in out.splitlines() if ln.strip()]
+    changed_files = [_normalize_repo_relpath(ln) for ln in out.splitlines() if ln.strip()]
     rule_files: List[str] = []
     code_files: List[str] = []
 
@@ -2253,8 +2261,453 @@ def _guard_check_scope(args: argparse.Namespace) -> int:
     )
 
 
+def _guard_renegotiate_batch(args: argparse.Namespace) -> int:
+    """
+    Batched renegotiation (P3.1): validates multiple targets against a single
+    SCAR-PROC-150 constructive witness, enforces red-failure + Merkle/config/env/cycle
+    invariants on every target before atomically writing any receipt (no --force).
+    """
+    batch_raw = (getattr(args, "batch", None) or "").strip()
+    batch_path = pathlib.Path(batch_raw).resolve()
+    if not batch_path.is_file():
+        return _emit(
+            {"ok": False, "error": f"INVALID_BATCH_MANIFEST: Batch manifest not found: {batch_path}"},
+            args.json,
+            exit_code=1,
+        )
+
+    try:
+        manifest_data = json.loads(batch_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return _emit(
+            {"ok": False, "error": f"INVALID_BATCH_MANIFEST: Failed to parse {batch_path}: {exc}"},
+            args.json,
+            exit_code=1,
+        )
+
+    manifest_meta: Dict[str, Any] = {}
+    if isinstance(manifest_data, list):
+        targets_list = manifest_data
+    elif isinstance(manifest_data, dict) and isinstance(manifest_data.get("targets"), list):
+        manifest_meta = manifest_data
+        targets_list = manifest_data["targets"]
+    else:
+        return _emit(
+            {"ok": False, "error": "INVALID_BATCH_MANIFEST: Manifest must be a JSON list or an object with 'targets'."},
+            args.json,
+            exit_code=1,
+        )
+
+    if not targets_list or not all(isinstance(t, dict) and str(t.get("test_dir", "")).strip() for t in targets_list):
+        return _emit(
+            {"ok": False, "error": "INVALID_BATCH_MANIFEST: Each target entry must be an object with non-empty 'test_dir'."},
+            args.json,
+            exit_code=1,
+        )
+
+    reason = (getattr(args, "reason", None) or manifest_meta.get("reason") or "").strip()
+    if not reason:
+        return _emit({"ok": False, "error": "MISSING_REASON: --reason is mandatory for batch renegotiation"}, args.json, exit_code=1)
+
+    witness_type = (getattr(args, "witness_type", None) or manifest_meta.get("witness_type") or "").strip() or None
+    require_witness = bool(getattr(args, "require_witness", False) or manifest_meta.get("require_witness", False))
+    conflict_a = (getattr(args, "conflict_a", None) or manifest_meta.get("conflict_a") or "").strip()
+    conflict_b = (getattr(args, "conflict_b", None) or manifest_meta.get("conflict_b") or "").strip()
+    fork_options = (getattr(args, "fork_options", None) or manifest_meta.get("fork_options") or "").strip()
+    cli_base_ref = (getattr(args, "base_ref", None) or manifest_meta.get("base_ref") or "").strip() or None
+    allow_head_move = bool(getattr(args, "allow_head_move", False))
+    allow_passthrough = bool(getattr(args, "allow_env_passthrough", False))
+    timeout_sec = float(getattr(args, "timeout", 120.0))
+
+    witness_args = argparse.Namespace(
+        witness_type=witness_type,
+        require_witness=require_witness,
+        conflict_a=conflict_a,
+        conflict_b=conflict_b,
+        fork_options=fork_options,
+    )
+
+    env_ok, env_err, clean_env, env_policy = _check_and_sanitize_env(allow_passthrough)
+    if not env_ok and env_err:
+        return _emit({"ok": False, **env_err}, args.json, exit_code=2)
+
+    renegotiated_at_iso = _utc_now_iso()
+    staged_items: List[Dict[str, Any]] = []
+    combined_stdout: List[str] = []
+    combined_stderr: List[str] = []
+    primary_repo_root: Optional[pathlib.Path] = None
+    primary_pinned_sha: Optional[str] = None
+    checked_base_specs: Set[Tuple[str, str]] = set()
+
+    for entry in targets_list:
+        raw_tdir = str(entry["test_dir"]).strip()
+        raw_target = pathlib.Path(raw_tdir)
+        if not raw_target.is_absolute():
+            # Allow relative paths from cwd first, falling back to manifest parent
+            if raw_target.exists():
+                raw_target = raw_target
+            elif (batch_path.parent / raw_target).exists():
+                raw_target = batch_path.parent / raw_target
+
+        if _is_symlink_or_junction(raw_target):
+            return _emit(
+                {"ok": False, "error": f"GUARD_INIT_FAILED: Symlinks and junctions are forbidden in Merkle guard target: {raw_target}"},
+                args.json,
+                exit_code=1,
+            )
+        test_path = raw_target.resolve()
+        if not test_path.exists():
+            return _emit(
+                {"ok": False, "error": f"TARGET_NOT_FOUND: Test target does not exist: {test_path}"},
+                args.json,
+                exit_code=1,
+            )
+
+        raw_sdir = entry.get("state_dir") or getattr(args, "state_dir", None)
+        state_dir = _resolve_state_dir(test_path, pathlib.Path(str(raw_sdir)) if raw_sdir else None)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        receipt_path = _receipt_path_for_target(state_dir, test_path)
+        repo_root, current_head_sha = _get_git_repo_and_head(test_path)
+
+        history: List[Dict[str, Any]] = []
+        collisions: List[Dict[str, Any]] = []
+        old_tree_hash = None
+        old_cmd = None
+        old_head_sha = None
+        inherited_ignore: List[str] = []
+        inherited_forbid: List[str] = []
+        recent_hashes: List[str] = []
+        old_data: Optional[Dict[str, Any]] = None
+
+        if receipt_path.is_file():
+            old_data, parse_err = _parse_guard_receipt(receipt_path)
+            if parse_err or old_data is None:
+                return _emit(
+                    {"ok": False, "error": f"CORRUPTED_RECEIPT: Cannot renegotiate over corrupted receipt at {receipt_path}: {parse_err}"},
+                    args.json,
+                    exit_code=2,
+                )
+            old_cmd = (old_data.get("cmd") or "").strip()
+            old_tree_hash = old_data.get("tree_hash")
+            old_head_sha = old_data.get("witnessed_head_sha")
+            if not old_tree_hash:
+                return _emit(
+                    {"ok": False, "error": f"CORRUPTED_RECEIPT: Cannot renegotiate over corrupted receipt at {receipt_path}: missing tree_hash"},
+                    args.json,
+                    exit_code=2,
+                )
+            raw_history = old_data.get("renegotiation_history", [])
+            if not isinstance(raw_history, list):
+                return _emit(
+                    {"ok": False, "error": f"CORRUPTED_RECEIPT: Cannot renegotiate over corrupted receipt at {receipt_path}: renegotiation_history must be a list"},
+                    args.json,
+                    exit_code=2,
+                )
+            history = list(raw_history)
+            collisions = list(old_data.get("collisions", [])) if isinstance(old_data.get("collisions"), list) else []
+            inherited_ignore = list(old_data.get("ignored_patterns", []))
+            inherited_forbid = list(old_data.get("forbidden_addopts", []))
+            recent_hashes = list(old_data.get("recent_tree_hashes", [])) if isinstance(old_data.get("recent_tree_hashes"), list) else []
+            hist_entry: Dict[str, Any] = {
+                "timestamp": old_data.get("timestamp_utc"),
+                "renegotiated_at": renegotiated_at_iso,
+                "status": old_data.get("status"),
+                "reason": old_data.get("reason"),
+                "tree_hash": old_tree_hash,
+                "witnessed_head_sha": old_head_sha,
+                "red_signature": old_data.get("red_signature", []),
+                "witnessed_test_count": old_data.get("witnessed_test_count"),
+                "cmd": old_cmd,
+            }
+            if "constructive_witness" in old_data:
+                hist_entry["constructive_witness"] = old_data["constructive_witness"]
+            history.append(hist_entry)
+
+            eff_base_ref = cli_base_ref or old_data.get("base_ref")
+            if old_head_sha and current_head_sha and old_head_sha != current_head_sha:
+                if allow_head_move:
+                    collisions.append({
+                        "timestamp_utc": renegotiated_at_iso,
+                        "event": "HEAD_MOVE_ALLOWED",
+                        "witnessed_head_sha": old_head_sha,
+                        "current_head_sha": current_head_sha,
+                    })
+                elif eff_base_ref and repo_root is not None and _git_is_ancestor(repo_root, old_head_sha, "HEAD"):
+                    pass
+                else:
+                    return _emit(
+                        {
+                            "ok": False,
+                            "error": f"HEAD_MOVED_DURING_RED_PHASE: Git HEAD moved from {old_head_sha[:8]} to {current_head_sha[:8]} before batch renegotiate.",
+                            "witnessed_head_sha": old_head_sha,
+                            "current_head_sha": current_head_sha,
+                        },
+                        args.json,
+                        exit_code=2,
+                    )
+        else:
+            eff_base_ref = cli_base_ref
+
+        merge_base_sha: Optional[str] = None
+        if eff_base_ref:
+            if repo_root is None or current_head_sha is None:
+                return _emit(
+                    {"ok": False, "error": "INVALID_BASE_REF: --base-ref requires an initialized Git repository."},
+                    args.json,
+                    exit_code=1,
+                )
+            merge_base_sha = _git_merge_base(repo_root, eff_base_ref, "HEAD")
+            if not merge_base_sha:
+                return _emit(
+                    {"ok": False, "error": f"INVALID_BASE_REF: Unable to resolve merge-base between '{eff_base_ref}' and HEAD."},
+                    args.json,
+                    exit_code=1,
+                )
+            base_cache_key = (str(repo_root), merge_base_sha)
+            if base_cache_key not in checked_base_specs:
+                checked_base_specs.add(base_cache_key)
+                cited_spec_files = _extract_cited_spec_files(witness_args, repo_root)
+                if cited_spec_files:
+                    modified_specs = _check_specs_modified_since_base(repo_root, merge_base_sha, cited_spec_files)
+                    if modified_specs:
+                        return _emit(
+                            {
+                                "ok": False,
+                                "error": f"SPEC_MODIFIED_SINCE_BASE: Cited specification file(s) modified since merge-base {merge_base_sha[:8]} ({eff_base_ref}): {', '.join(modified_specs)}",
+                                "base_ref": eff_base_ref,
+                                "merge_base_sha": merge_base_sha,
+                                "modified_files": modified_specs,
+                            },
+                            args.json,
+                            exit_code=2,
+                        )
+
+        raw_entry_ignore = entry.get("ignore")
+        if isinstance(raw_entry_ignore, list):
+            entry_ignore = [str(x).strip() for x in raw_entry_ignore if str(x).strip()]
+        else:
+            entry_ignore = _parse_ignore_patterns(str(raw_entry_ignore or "") or getattr(args, "ignore", ""))
+        effective_ignore = entry_ignore if entry_ignore else inherited_ignore
+
+        entry_forbid = _parse_ignore_patterns(str(entry.get("forbid_addopts") or "") or getattr(args, "forbid_addopts", ""))
+        effective_forbid = sorted(set(inherited_forbid) | set(entry_forbid))
+
+        cmd_str = str(entry.get("cmd") or "").strip() or (args.cmd.strip() if args.cmd else "") or (old_cmd or "")
+        if not cmd_str:
+            return _emit(
+                {"ok": False, "error": f"MISSING_CMD: Test command is required for batch target {test_path}"},
+                args.json,
+                exit_code=1,
+            )
+
+        try:
+            root_base, root_manifest, ini_paths = _collect_root_config_manifest(test_path)
+        except (ValueError, OSError) as exc:
+            return _emit({"ok": False, "error": f"GUARD_RENEGOTIATE_FAILED: {exc}"}, args.json, exit_code=1)
+
+        addopts_ok, addopts_err = _inspect_pytest_addopts(ini_paths, cmd_str, effective_forbid)
+        if not addopts_ok and addopts_err:
+            return _emit({"ok": False, **addopts_err}, args.json, exit_code=2)
+
+        try:
+            pre_hash, pre_files = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
+        except (ValueError, OSError) as exc:
+            return _emit({"ok": False, "error": f"GUARD_RENEGOTIATE_FAILED: {exc}"}, args.json, exit_code=1)
+        if not pre_files:
+            return _emit(
+                {"ok": False, "error": f"EMPTY_TEST_TARGET: No files found to seal in {test_path}"},
+                args.json,
+                exit_code=1,
+            )
+
+        returncode, stdout_txt, stderr_txt, timed_out, elapsed_ms = _run_command_isolated(cmd_str, timeout_sec, env=clean_env)
+        if timed_out:
+            return _emit(
+                {"ok": False, "error": f"COMMAND_TIMED_OUT: Test command exceeded {timeout_sec}s during batch renegotiate", "cmd": cmd_str, "target": str(test_path)},
+                args.json,
+                exit_code=1,
+            )
+        if returncode == 0:
+            return _emit(
+                {
+                    "ok": False,
+                    "error": f"COOPERATIVE_RENEGOTIATION: Batch target '{test_path}' passed immediately (exit 0). Every target must fail against clean code.",
+                    "cmd": cmd_str,
+                    "target": str(test_path),
+                },
+                args.json,
+                exit_code=1,
+            )
+
+        expected_exit = entry.get("expected_exit", getattr(args, "expected_exit", None))
+        if expected_exit is not None and returncode != int(expected_exit):
+            return _emit(
+                {
+                    "ok": False,
+                    "error": f"UNEXPECTED_EXIT_CODE: Expected exit code {expected_exit}, got {returncode} on {test_path}.",
+                    "cmd": cmd_str,
+                    "returncode": returncode,
+                },
+                args.json,
+                exit_code=1,
+            )
+        if expected_exit is None and returncode in (2, 3, 4, 5, 126, 127, 9009):
+            return _emit(
+                {
+                    "ok": False,
+                    "error": f"INVALID_TEST_INVOCATION: Exit code {returncode} indicates collection, syntax, or command error on {test_path}.",
+                    "cmd": cmd_str,
+                    "returncode": returncode,
+                    "stderr": (stderr_txt or stdout_txt)[-500:],
+                },
+                args.json,
+                exit_code=1,
+            )
+
+        try:
+            tree_hash, files_map = _compute_merkle_tree(test_path, state_dir, receipt_path, effective_ignore)
+        except (ValueError, OSError) as exc:
+            return _emit(
+                {"ok": False, "error": f"SELF_MUTATING_TEST_DIR: Forbidden filesystem state on {test_path}: {exc}"},
+                args.json,
+                exit_code=1,
+            )
+        if tree_hash != pre_hash:
+            return _emit(
+                {"ok": False, "error": f"SELF_MUTATING_TEST_DIR: Test execution modified files inside {test_path} during batch renegotiate."},
+                args.json,
+                exit_code=1,
+            )
+
+        working_tree_hash = _compute_working_tree_hash(repo_root, files_map, current_head_sha=current_head_sha)
+        cycle_len = _detect_oscillation_cycle(recent_hashes, working_tree_hash, allow_initial_same=True)
+        if cycle_len is not None and cycle_len >= 2:
+            return _emit(
+                {
+                    "ok": False,
+                    "error": f"OSCILLATION_CYCLE_DETECTED: Batch target '{test_path}' reverted working tree to an earlier state (cycle_length={cycle_len}).",
+                    "cycle_length": cycle_len,
+                    "repeated_hash": working_tree_hash,
+                },
+                args.json,
+                exit_code=2,
+            )
+
+        pinned_sha_for_witness = old_head_sha or current_head_sha
+        if primary_repo_root is None and repo_root is not None:
+            primary_repo_root = repo_root
+            primary_pinned_sha = pinned_sha_for_witness
+
+        combined_stdout.append(stdout_txt)
+        combined_stderr.append(stderr_txt)
+        red_signature = _extract_red_signature(stdout_txt, stderr_txt)
+        exec_counts = _extract_test_execution_counts(cmd_str, stdout_txt, stderr_txt)
+        witnessed_test_count = exec_counts["total"] if exec_counts is not None else None
+
+        staged_receipt: Dict[str, Any] = {
+            "version": 2,
+            "schema_version": _SCHEMA_VERSION,
+            "status": "RENEGOTIATED_RED",
+            "timestamp_utc": renegotiated_at_iso,
+            "test_target": str(test_path),
+            "reason": reason,
+            "cmd": cmd_str,
+            "tree_hash": tree_hash,
+            "previous_tree_hash": old_tree_hash,
+            "witnessed_head_sha": pinned_sha_for_witness,
+            "base_ref": eff_base_ref,
+            "merge_base_sha": merge_base_sha,
+            "red_exit_code": returncode,
+            "red_signature": red_signature,
+            "witnessed_test_count": witnessed_test_count,
+            "elapsed_ms": elapsed_ms,
+            "ignored_patterns": effective_ignore,
+            "forbidden_addopts": effective_forbid,
+            "env_policy": env_policy,
+            "root_config_base": str(root_base),
+            "root_config_manifest": root_manifest,
+            "recent_tree_hashes": _append_bounded_history(recent_hashes, working_tree_hash, maxlen=16),
+            "verify_attempts": 0,
+            "files": files_map,
+            "renegotiation_history": history,
+            "collisions": collisions,
+        }
+        staged_items.append({
+            "test_path": test_path,
+            "receipt_path": receipt_path,
+            "receipt": staged_receipt,
+            "tree_hash": tree_hash,
+        })
+
+    if primary_repo_root is not None and primary_pinned_sha and witness_type in ("spec-collision", "arch-fork"):
+        with GitBatchReader(primary_repo_root) as git_reader:
+            witness_ok, witness_err, witness_proof = _verify_constructive_witness(
+                witness_args,
+                "\n".join(combined_stdout),
+                "\n".join(combined_stderr),
+                repo_root=primary_repo_root,
+                pinned_sha=primary_pinned_sha,
+                git_reader=git_reader,
+            )
+    else:
+        witness_ok, witness_err, witness_proof = _verify_constructive_witness(
+            witness_args,
+            "\n".join(combined_stdout),
+            "\n".join(combined_stderr),
+            repo_root=primary_repo_root,
+            pinned_sha=primary_pinned_sha,
+        )
+    if not witness_ok:
+        return _emit({"ok": False, "error": witness_err}, args.json, exit_code=1)
+
+    batch_seed = "|".join(f"{item['receipt_path']}:{item['tree_hash']}" for item in staged_items)
+    batch_id = hashlib.sha256(batch_seed.encode("utf-8")).hexdigest()[:12]
+    batch_targets = [str(item["test_path"]) for item in staged_items]
+
+    written_targets: List[Dict[str, Any]] = []
+    for item in staged_items:
+        rec = item["receipt"]
+        rec["batch_id"] = batch_id
+        rec["batch_targets"] = batch_targets
+        if witness_proof is not None:
+            rec["constructive_witness"] = witness_proof
+        _atomic_write_json(item["receipt_path"], rec)
+        written_targets.append({
+            "test_target": str(item["test_path"]),
+            "new_tree_hash": rec["tree_hash"],
+            "red_exit_code": rec["red_exit_code"],
+            "witnessed_test_count": rec["witnessed_test_count"],
+            "receipt_file": str(item["receipt_path"]),
+        })
+
+    return _emit(
+        {
+            "ok": True,
+            "schema_version": _SCHEMA_VERSION,
+            "status": "RENEGOTIATED_RED_BATCH",
+            "batch_id": batch_id,
+            "reason": reason,
+            "targets_count": len(written_targets),
+            "targets": written_targets,
+            "constructive_witness": witness_proof,
+        },
+        args.json,
+        exit_code=0,
+    )
+
+
 def _cmd_guard(args: argparse.Namespace) -> int:
     action = args.guard_action
+    batch_arg = (getattr(args, "batch", None) or "").strip()
+    if batch_arg:
+        if action != "renegotiate":
+            return _emit(
+                {"ok": False, "error": f"INVALID_BATCH_ACTION: --batch is only supported with 'guard renegotiate', got '{action}'."},
+                args.json,
+                exit_code=1,
+            )
+        return _guard_renegotiate_batch(args)
+
     if action == "check-scope":
         return _guard_check_scope(args)
 
@@ -2549,9 +3002,13 @@ def _cmd_state(args: argparse.Namespace) -> int:
         strict_mode = bool(getattr(args, "strict", False))
 
         candidates: List[Tuple[int, str, str]] = []
+        osc_path_str: Optional[str] = None
         with os.scandir(state_dir) as it:
             for entry in it:
                 if entry.is_file():
+                    if entry.name == "oscillation_history.json":
+                        osc_path_str = entry.path
+                        continue
                     m = _STEP_FILE_RE.match(entry.name)
                     if m:
                         candidates.append((int(m.group(1)), entry.name, entry.path))
@@ -2638,10 +3095,9 @@ def _cmd_state(args: argparse.Namespace) -> int:
         }
         if late_sealed_notices:
             payload["late_sealed_notices"] = late_sealed_notices
-        osc_path = state_dir / "oscillation_history.json"
-        if osc_path.is_file():
+        if osc_path_str is not None:
             try:
-                with open(osc_path, "r", encoding="utf-8") as of:
+                with open(osc_path_str, "r", encoding="utf-8") as of:
                     osc_loaded = json.load(of)
                 if isinstance(osc_loaded, dict) and isinstance(osc_loaded.get("recent_tree_hashes"), list):
                     payload["recent_tree_hashes"] = osc_loaded["recent_tree_hashes"]
@@ -2885,6 +3341,126 @@ def _rule_call_tk(node: ast.AST, ctx: _LintFileContext) -> None:
             _check_font_node(kw.value, node.lineno, ctx)
 
 
+_MUT001_QUERY_PREFIXES: Tuple[str, ...] = ("get_", "is_", "has_", "validate_")
+_MUT001_MUTATING_METHODS: Set[str] = {"append", "extend", "pop", "clear", "update"}
+_ALLOW_MUTATION_RE = re.compile(r"#\s*ag_ops:\s*allow-mutation\b(.*)$", re.I)
+
+
+def _extract_self_mutation_target(target: ast.AST) -> Optional[str]:
+    if isinstance(target, ast.Attribute):
+        if isinstance(target.value, ast.Name) and target.value.id == "self":
+            return f"self.{target.attr}"
+        return None
+    if isinstance(target, ast.Subscript):
+        cur: ast.AST = target
+        while isinstance(cur, ast.Subscript):
+            cur = cur.value
+        if isinstance(cur, ast.Attribute) and isinstance(cur.value, ast.Name) and cur.value.id == "self":
+            return f"self.{cur.attr}[...]"
+        return None
+    if isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            found = _extract_self_mutation_target(elt)
+            if found:
+                return found
+    return None
+
+
+def _find_mut001_justification(source_lines: List[str], def_lineno: int, mut_lineno: int) -> Optional[str]:
+    for ln in (mut_lineno, def_lineno):
+        if 1 <= ln <= len(source_lines):
+            m = _ALLOW_MUTATION_RE.search(source_lines[ln - 1])
+            if m:
+                reason = m.group(1).lstrip(":- ").strip()
+                if reason:
+                    return reason
+    return None
+
+
+def _rule_mut001_func(node: ast.AST, ctx: _LintFileContext) -> None:
+    """
+    Rule MUT001: Detects hidden state mutations (`self.<attr> = ...`, `global`,
+    or `.append/.extend/.pop/.clear/.update` on `self.<attr>`) inside query methods
+    named `get_*`, `is_*`, `has_*`, `validate_*` without descending into nested scopes.
+    """
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return
+    if not node.name.startswith(_MUT001_QUERY_PREFIXES):
+        return
+
+    findings: List[Tuple[int, str]] = []
+    stack: List[ast.AST] = list(reversed(node.body))
+    nested_scope_types = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+    while stack:
+        curr = stack.pop()
+        if isinstance(curr, nested_scope_types):
+            continue
+
+        if isinstance(curr, ast.Global):
+            findings.append((curr.lineno, f"global {', '.join(curr.names)}"))
+        elif isinstance(curr, ast.Assign):
+            for tgt in curr.targets:
+                self_tgt = _extract_self_mutation_target(tgt)
+                if self_tgt:
+                    findings.append((curr.lineno, f"assignment to {self_tgt}"))
+        elif isinstance(curr, ast.AugAssign):
+            self_tgt = _extract_self_mutation_target(curr.target)
+            if self_tgt:
+                findings.append((curr.lineno, f"augmented assignment to {self_tgt}"))
+        elif isinstance(curr, ast.AnnAssign):
+            if curr.value is not None:
+                self_tgt = _extract_self_mutation_target(curr.target)
+                if self_tgt:
+                    findings.append((curr.lineno, f"annotated assignment to {self_tgt}"))
+        elif isinstance(curr, ast.Delete):
+            for tgt in curr.targets:
+                self_tgt = _extract_self_mutation_target(tgt)
+                if self_tgt:
+                    findings.append((curr.lineno, f"deletion of {self_tgt}"))
+        elif isinstance(curr, ast.Call):
+            if (
+                isinstance(curr.func, ast.Attribute)
+                and curr.func.attr in _MUT001_MUTATING_METHODS
+                and isinstance(curr.func.value, ast.Attribute)
+                and isinstance(curr.func.value.value, ast.Name)
+                and curr.func.value.value.id == "self"
+            ):
+                findings.append((curr.lineno, f"in-place mutating call self.{curr.func.value.attr}.{curr.func.attr}()"))
+
+        for fname in reversed(curr._fields):
+            val = getattr(curr, fname, None)
+            if isinstance(val, ast.AST):
+                if not isinstance(val, nested_scope_types):
+                    stack.append(val)
+            elif isinstance(val, list):
+                for item in reversed(val):
+                    if isinstance(item, ast.AST) and not isinstance(item, nested_scope_types):
+                        stack.append(item)
+
+    for mut_lineno, desc in findings:
+        justification = _find_mut001_justification(ctx.source_lines, node.lineno, mut_lineno)
+        if justification:
+            ctx.suppressed_mutations.append({
+                "file": ctx.filename,
+                "line": mut_lineno,
+                "function": node.name,
+                "rule": "MUT001",
+                "mutation": desc,
+                "justification": justification,
+            })
+        else:
+            ctx.warnings.append({
+                "file": ctx.filename,
+                "line": mut_lineno,
+                "rule": "MUT001",
+                "severity": "WARNING",
+                "function": node.name,
+                "message": f"Hidden mutation ({desc}) inside query method '{node.name}'.",
+                "reflex": "Remove side effects from the query method or document with '# ag_ops: allow-mutation: <reason>'.",
+            })
+
+
 _RuleFn = Callable[[ast.AST, _LintFileContext], None]
 
 _DEFAULT_LINT_DISPATCH: Dict[Type[ast.AST], List[_RuleFn]] = {
@@ -2892,6 +3468,8 @@ _DEFAULT_LINT_DISPATCH: Dict[Type[ast.AST], List[_RuleFn]] = {
     ast.ImportFrom: [_rule_import_from],
     ast.Call: [_rule_call_tk],
     ast.ExceptHandler: [_rule_path001_except],
+    ast.FunctionDef: [_rule_mut001_func],
+    ast.AsyncFunctionDef: [_rule_mut001_func],
 }
 
 
@@ -3290,6 +3868,8 @@ def _cmd_ast_lint(args: argparse.Namespace) -> int:
     now_ns = time.time_ns()
 
     raw_violations: List[Dict[str, Any]] = []
+    raw_warnings: List[Dict[str, Any]] = []
+    suppressed_mutations: List[Dict[str, Any]] = []
     files_checked = 0
     cache_hits = 0
 
@@ -3320,6 +3900,10 @@ def _cmd_ast_lint(args: argparse.Namespace) -> int:
                         if isinstance(cached_res, dict):
                             for item in cached_res.get("violations", []):
                                 raw_violations.append(dict(item))
+                            for item in cached_res.get("warnings", []):
+                                raw_warnings.append(dict(item))
+                            for item in cached_res.get("suppressed_mutations", []):
+                                suppressed_mutations.append(dict(item))
                             cache_hits += 1
                             return
             except OSError:
@@ -3336,6 +3920,8 @@ def _cmd_ast_lint(args: argparse.Namespace) -> int:
         source = raw_bytes.decode("utf-8", errors="replace")
         file_violations, file_warnings, file_suppressed = _lint_python_source(fpath, source, author_param)
         raw_violations.extend(file_violations)
+        raw_warnings.extend(file_warnings)
+        suppressed_mutations.extend(file_suppressed)
 
         if cache_enabled:
             try:
@@ -3385,7 +3971,17 @@ def _cmd_ast_lint(args: argparse.Namespace) -> int:
         except OSError as exc:
             sys.stderr.write(f"[ag_ops] Warning: could not persist stat cache to {cache_path}: {exc}\n")
 
-    enforced_violations, probationary_warnings = _apply_context_signatures(raw_violations, context_sigs)
+    effective_raw_violations = list(raw_violations)
+    effective_raw_warnings: List[Dict[str, Any]] = []
+    if strict_mode:
+        for warning_item in raw_warnings:
+            promoted = dict(warning_item)
+            promoted["severity"] = "error"
+            effective_raw_violations.append(promoted)
+    else:
+        effective_raw_warnings = list(raw_warnings)
+
+    enforced_violations, probationary_warnings = _apply_context_signatures(effective_raw_violations, context_sigs)
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 3)
 
     payload: Dict[str, Any] = {
@@ -3395,7 +3991,12 @@ def _cmd_ast_lint(args: argparse.Namespace) -> int:
         "cache_hits": cache_hits,
         "violations_count": len(enforced_violations),
         "violations": enforced_violations,
+        "warnings_count": len(effective_raw_warnings),
+        "warnings": effective_raw_warnings,
     }
+    if suppressed_mutations:
+        payload["suppressed_mutations_count"] = len(suppressed_mutations)
+        payload["suppressed_mutations"] = suppressed_mutations
     if probationary_warnings:
         payload["probationary_count"] = len(probationary_warnings)
         payload["probationary_warnings"] = probationary_warnings
@@ -3842,94 +4443,107 @@ def _cmd_regret_mine(args: argparse.Namespace) -> int:
 # CLI PARSER BUILDER
 # =============================================================================
 
-def build_parser() -> argparse.ArgumentParser:
+_SUBCOMMANDS: Tuple[str, ...] = ("guard", "distill", "state", "ast-lint", "regret-mine")
+
+
+def build_parser(only_subcommand: Optional[str] = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ag_ops.py",
         description="Deterministic CLI Engine for Agent Governance, Merkle Guardrails, Distillation, Runlevels & Regret Mining.",
     )
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
+    scope = only_subcommand if only_subcommand in _SUBCOMMANDS else None
 
     # 1. guard
-    p_guard = subparsers.add_parser("guard", help="Merkle-locked test verification and contract enforcement.")
-    p_guard.add_argument("guard_action", choices=["witness-red", "verify-green", "renegotiate", "check-scope"])
-    p_guard.add_argument("--test-dir", default=None, help="Test file or directory to seal in Merkle tree.")
-    p_guard.add_argument("--cmd", default="", help="Test execution command line.")
-    p_guard.add_argument("--state-dir", default=None, help="Directory to store merkle_guard_<hash>.json (default: .ag_state).")
-    p_guard.add_argument("--ignore", default="", help="Comma-separated glob/relative paths to exclude and record in receipt.")
-    p_guard.add_argument("--reason", default="", help="Mandatory rationale for renegotiate.")
-    p_guard.add_argument(
-        "--witness-type",
-        choices=["spec-collision", "api-lock", "arch-fork"],
-        default=None,
-        help="SCAR-PROC-150 Constructive Witness proof type for renegotiate.",
-    )
-    p_guard.add_argument("--require-witness", action="store_true", help="Reject prose-only renegotiate without --witness-type.")
-    p_guard.add_argument("--conflict-a", default="", help="First conflicting requirement 'file:line' for spec-collision.")
-    p_guard.add_argument("--conflict-b", default="", help="Second conflicting requirement 'file:line' for spec-collision.")
-    p_guard.add_argument("--fork-options", default="", help="Pipe-separated 'OptionA@file:line|OptionB@file:line' for arch-fork.")
-    p_guard.add_argument("--expected-exit", type=int, default=None, help="Expected exit code for witness-red/renegotiate.")
-    p_guard.add_argument("--allow-head-move", action="store_true", help="Allow Git HEAD to differ from witnessed_head_sha during verify-green/renegotiate.")
-    p_guard.add_argument("--base-ref", default=None, help="Anchor branch/ref for git merge-base ancestor and spec immutability checks.")
-    p_guard.add_argument("--base", default="origin/main", help="Base ref for guard check-scope diff comparison (default: origin/main).")
-    p_guard.add_argument("--rule-paths", default="", help="Comma-separated governance/spec paths for guard check-scope.")
-    p_guard.add_argument("--repo", default=".", help="Git repository path for guard check-scope (default: .).")
-    p_guard.add_argument("--forbid-addopts", default="", help="Comma-separated addopts flags/patterns to forbid in pytest configs (e.g. '-p no:cov,-p no:assertion').")
-    p_guard.add_argument("--allow-env-passthrough", action="store_true", help="Allow tainted environment variables (e.g. PYTEST_ADDOPTS) and record in receipt.")
-    p_guard.add_argument("--timeout", type=float, default=120.0, help="Test execution timeout in seconds.")
-    p_guard.add_argument("--json", action="store_true", help="Emit deterministic JSON.")
+    if scope in (None, "guard"):
+        p_guard = subparsers.add_parser("guard", help="Merkle-locked test verification and contract enforcement.")
+        p_guard.add_argument("guard_action", choices=["witness-red", "verify-green", "renegotiate", "check-scope"])
+        p_guard.add_argument("--test-dir", default=None, help="Test file or directory to seal in Merkle tree.")
+        p_guard.add_argument("--cmd", default="", help="Test execution command line.")
+        p_guard.add_argument("--state-dir", default=None, help="Directory to store merkle_guard_<hash>.json (default: .ag_state).")
+        p_guard.add_argument("--ignore", default="", help="Comma-separated glob/relative paths to exclude and record in receipt.")
+        p_guard.add_argument("--reason", default="", help="Mandatory rationale for renegotiate.")
+        p_guard.add_argument(
+            "--witness-type",
+            choices=["spec-collision", "api-lock", "arch-fork"],
+            default=None,
+            help="SCAR-PROC-150 Constructive Witness proof type for renegotiate.",
+        )
+        p_guard.add_argument("--require-witness", action="store_true", help="Reject prose-only renegotiate without --witness-type.")
+        p_guard.add_argument("--conflict-a", default="", help="First conflicting requirement 'file:line' for spec-collision.")
+        p_guard.add_argument("--conflict-b", default="", help="Second conflicting requirement 'file:line' for spec-collision.")
+        p_guard.add_argument("--fork-options", default="", help="Pipe-separated 'OptionA@file:line|OptionB@file:line' for arch-fork.")
+        p_guard.add_argument("--expected-exit", type=int, default=None, help="Expected exit code for witness-red/renegotiate.")
+        p_guard.add_argument("--allow-head-move", action="store_true", help="Allow Git HEAD to differ from witnessed_head_sha during verify-green/renegotiate.")
+        p_guard.add_argument("--base-ref", default=None, help="Anchor branch/ref for git merge-base ancestor and spec immutability checks.")
+        p_guard.add_argument("--base", default="origin/main", help="Base ref for guard check-scope diff comparison (default: origin/main).")
+        p_guard.add_argument("--rule-paths", default="", help="Comma-separated governance/spec paths for guard check-scope.")
+        p_guard.add_argument("--repo", default=".", help="Git repository path for guard check-scope (default: .).")
+        p_guard.add_argument("--forbid-addopts", default="", help="Comma-separated addopts flags/patterns to forbid in pytest configs (e.g. '-p no:cov,-p no:assertion').")
+        p_guard.add_argument("--allow-env-passthrough", action="store_true", help="Allow tainted environment variables (e.g. PYTEST_ADDOPTS) and record in receipt.")
+        p_guard.add_argument("--batch", default=None, help="JSON manifest path for batched renegotiate sharing one SCAR-PROC-150 witness.")
+        p_guard.add_argument("--timeout", type=float, default=120.0, help="Test execution timeout in seconds.")
+        p_guard.add_argument("--json", action="store_true", help="Emit deterministic JSON.")
 
     # 2. distill
-    p_distill = subparsers.add_parser("distill", help="Deterministic output distillation with timeout protection.")
-    p_distill.add_argument("--cmd", required=True, help="Command to execute.")
-    p_distill.add_argument("--max-lines", type=int, default=35, help="Maximum lines of critical delta.")
-    p_distill.add_argument("--log-dir", default="./logs", help="Directory to save raw execution logs.")
-    p_distill.add_argument("--timeout", type=float, default=120.0, help="Process timeout in seconds.")
-    p_distill.add_argument("--json", action="store_true", help="Emit deterministic JSON.")
+    if scope in (None, "distill"):
+        p_distill = subparsers.add_parser("distill", help="Deterministic output distillation with timeout protection.")
+        p_distill.add_argument("--cmd", required=True, help="Command to execute.")
+        p_distill.add_argument("--max-lines", type=int, default=35, help="Maximum lines of critical delta.")
+        p_distill.add_argument("--log-dir", default="./logs", help="Directory to save raw execution logs.")
+        p_distill.add_argument("--timeout", type=float, default=120.0, help="Process timeout in seconds.")
+        p_distill.add_argument("--json", action="store_true", help="Emit deterministic JSON.")
 
     # 3. state
-    p_state = subparsers.add_parser("state", help="Lexical runlevel state manager with artifact drift verification.")
-    p_state.add_argument("state_action", choices=["write", "status"])
-    p_state.add_argument("--dir", required=True, help="State directory containing NN_*.json files.")
-    p_state.add_argument("--step", type=int, default=0, help="Step number (e.g. 0, 10, 20).")
-    p_state.add_argument("--name", default="step", help="Slug name for the runlevel.")
-    p_state.add_argument("--status", default="COMPLETADO", help="Status: PENDIENTE | EN_PROGRESO | COMPLETADO | FALLIDO.")
-    p_state.add_argument("--summary", default="", help="Summary text of the phase.")
-    p_state.add_argument("--artifacts", default="", help="Comma-separated paths to produced artifacts.")
-    p_state.add_argument("--replace", action="store_true", help="Overwrite existing step file if slug differs.")
-    p_state.add_argument("--strict", action="store_true", help="Exit with code 2 on status if artifact drift is detected.")
-    p_state.add_argument("--json", action="store_true", help="Emit deterministic JSON.")
+    if scope in (None, "state"):
+        p_state = subparsers.add_parser("state", help="Lexical runlevel state manager with artifact drift verification.")
+        p_state.add_argument("state_action", choices=["write", "status"])
+        p_state.add_argument("--dir", required=True, help="State directory containing NN_*.json files.")
+        p_state.add_argument("--step", type=int, default=0, help="Step number (e.g. 0, 10, 20).")
+        p_state.add_argument("--name", default="step", help="Slug name for the runlevel.")
+        p_state.add_argument("--status", default="COMPLETADO", help="Status: PENDIENTE | EN_PROGRESO | COMPLETADO | FALLIDO.")
+        p_state.add_argument("--summary", default="", help="Summary text of the phase.")
+        p_state.add_argument("--artifacts", default="", help="Comma-separated paths to produced artifacts.")
+        p_state.add_argument("--replace", action="store_true", help="Overwrite existing step file if slug differs.")
+        p_state.add_argument("--strict", action="store_true", help="Exit with code 2 on status if artifact drift is detected.")
+        p_state.add_argument("--json", action="store_true", help="Emit deterministic JSON.")
 
     # 4. ast-lint
-    p_lint = subparsers.add_parser("ast-lint", help="Sub-15ms static AST & DOT state-machine linter.")
-    p_lint.add_argument("target", help="Python (.py), Graphviz (.dot) file, or folder to lint.")
-    p_lint.add_argument("--author", default=None, help="Optional author string to enforce in file headers (AUTH001).")
-    p_lint.add_argument("--include-dot", action="store_true", help="Also lint .dot state machine files when target is a directory.")
-    p_lint.add_argument("--context-map", default=None, help="Path to JSON mapping rule IDs to anchor file SHA-256 signatures.")
-    p_lint.add_argument("--strict", action="store_true", help="Rejects probationary findings with STRICT_PROBATIONARY (exit code 2) if anchor drift occurred.")
-    p_lint.add_argument("--no-cache", action="store_true", help="Disable incremental .ag_state/stat_cache.json lookup.")
-    p_lint.add_argument("--json", action="store_true", help="Emit deterministic JSON.")
+    if scope in (None, "ast-lint"):
+        p_lint = subparsers.add_parser("ast-lint", help="Sub-15ms static AST & DOT state-machine linter.")
+        p_lint.add_argument("target", help="Python (.py), Graphviz (.dot) file, or folder to lint.")
+        p_lint.add_argument("--author", default=None, help="Optional author string to enforce in file headers (AUTH001).")
+        p_lint.add_argument("--include-dot", action="store_true", help="Also lint .dot state machine files when target is a directory.")
+        p_lint.add_argument("--context-map", default=None, help="Path to JSON mapping rule IDs to anchor file SHA-256 signatures.")
+        p_lint.add_argument("--strict", action="store_true", help="Rejects probationary findings with STRICT_PROBATIONARY (exit code 2) if anchor drift occurred.")
+        p_lint.add_argument("--no-cache", action="store_true", help="Disable incremental .ag_state/stat_cache.json lookup.")
+        p_lint.add_argument("--json", action="store_true", help="Emit deterministic JSON.")
 
     # 5. regret-mine
-    p_regret = subparsers.add_parser("regret-mine", help="Stage-1 Rapid-Regret AST & Receipt Miner over Git history.")
-    p_regret.add_argument("--repo", default=".", help="Path to Git repository (default: current directory).")
-    p_regret.add_argument("--window-min", type=int, default=60, help="Maximum minutes between overlapping commits (default: 60).")
-    p_regret.add_argument("--limit", type=int, default=100, help="Maximum recent commits to scan (default: 100).")
-    p_regret.add_argument("--state-dir", default=None, help="Optional .ag_state directory to correlate guard collisions.")
-    p_regret.add_argument("--json", action="store_true", help="Emit deterministic JSON.")
+    if scope in (None, "regret-mine"):
+        p_regret = subparsers.add_parser("regret-mine", help="Stage-1 Rapid-Regret AST & Receipt Miner over Git history.")
+        p_regret.add_argument("--repo", default=".", help="Path to Git repository (default: current directory).")
+        p_regret.add_argument("--window-min", type=int, default=60, help="Maximum minutes between overlapping commits (default: 60).")
+        p_regret.add_argument("--limit", type=int, default=100, help="Maximum recent commits to scan (default: 100).")
+        p_regret.add_argument("--state-dir", default=None, help="Optional .ag_state directory to correlate guard collisions.")
+        p_regret.add_argument("--json", action="store_true", help="Emit deterministic JSON.")
 
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
+        enc = (getattr(stream, "encoding", "") or "").lower().replace("_", "-")
+        if enc != "utf-8" and hasattr(stream, "reconfigure"):
             try:
                 stream.reconfigure(encoding="utf-8", errors="replace")
             except (OSError, ValueError, AttributeError):
                 pass
 
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = sys.argv[1:] if argv is None else list(argv)
+    sub = raw_argv[0] if raw_argv and raw_argv[0] in _SUBCOMMANDS else None
+    parser = build_parser(only_subcommand=sub)
+    args = parser.parse_args(raw_argv)
 
     if args.subcommand == "guard":
         return _cmd_guard(args)

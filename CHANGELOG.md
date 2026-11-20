@@ -5,6 +5,39 @@ Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/).
 
 Creado por Francisco Grandón Vergara
 
+## [2.4.0] - 2026-11-20
+
+### Añadido
+- **Hardening P0 de Superficie Raíz y Entorno (`guard`)**:
+  - Sellado de `root_config_manifest` y `root_config_base` desde `--test-dir` hasta la raíz del repositorio/workspace (`conftest.py`, `pytest.ini`, `pyproject.toml`, `setup.cfg`, `tox.ini`, `sitecustomize.py`, `usercustomize.py`), registrando `ABSENT` para archivos inexistentes y detectando altas o mutaciones tardías como `ROOT_CONFIG_DRIFT` (exit `2`), además de rechazo a symlinks/junctions en ancestros y configuraciones raíz.
+  - Inspección determinista de `addopts` con `tomllib`/`configparser` bloqueando flags evasivos (`--collect-only`, `--co`, filtros `-k`/`--ignore`/`--ignore-glob` no declarados en `--cmd`) y patrones personalizados mediante `--forbid-addopts` (`UNSAFE_PYTEST_ADDOPTS`, exit `2`).
+  - Sanitización por defecto de `PYTEST_ADDOPTS` y `PYTHONSTARTUP` (`ENV_TAINT_DETECTED`, exit `2`) y política auditable `env_policy` mediante `--allow-env-passthrough` (impidiendo relajar la política entre `witness-red` y `verify-green`).
+  - Extracción y verificación del conteo efectivo de pruebas ejecutadas (`witnessed_test_count`), rechazando ejecuciones vacías (`ZERO_TESTS_EXECUTED`, exit `2`) y reducciones de cobertura parametrizada (`TEST_COUNT_REGRESSION`, exit `2`).
+  - Evolución del esquema de recibos a `schema_version: "2.4"` manteniendo compatibilidad de lectura/verificación con recibos históricos v2.3 sin `schema_version`.
+  - +6 escenarios adversariales en `benchmark_agent_failures.py` (`TAM-07`..`TAM-12`) sobre un total de 36 escenarios.
+- **Motor de Rendimiento P1 (100% stdlib)**:
+  - `SinglePassVisitor` con tabla de despacho `_DEFAULT_LINT_DISPATCH` y `_LintFileContext` en un único recorrido AST por archivo `.py`, además de `_StringLiteralScrubber` directo sobre clones AST sin `ast.unparse`/`ast.parse`.
+  - Hashing acelerado con `hashlib.file_digest` en archivos binarios/sin normalización y streaming por bloques de 64 KB con acarreo de `\r` en frontera para normalización CRLF->LF en `_sha256_file`.
+  - `GitBatchReader` (`git cat-file --batch`) para lectura por lotes en un único subproceso de Git en `guard renegotiate` y `regret-mine`, junto con `_git_batch_changed_line_sets`.
+  - Caché incremental `.ag_state/stat_cache.json` por `(mtime_ns, size, sha256, ast_rules_hash)` con guardia anti-racy de 50 ms y protección contra retroceso de reloj (`mtime_ns > now_ns`), desactivable con `--no-cache` y deshabilitada automáticamente en `--strict`.
+- **Gobernanza P2 de Historial, Ciclos y Alcance**:
+  - Anclaje mediante `--base-ref <ref>` en `guard witness-red` y `guard renegotiate` usando `git merge-base --is-ancestor` (habilitando commits legítimos que avanzan `HEAD` sobre pruebas selladas) y bloqueo de alteraciones en especificaciones citadas desde el `merge-base` (`SPEC_MODIFIED_SINCE_BASE`, exit `2`). Auditoría explícita `HEAD_MOVE_ALLOWED` al utilizar `--allow-head-move`.
+  - Detector determinista de oscilaciones `k`-ciclo (`recent_tree_hashes` acotado a 16 estados con `collections.deque(maxlen=16)`) en `guard` (`merkle_guard_<hash>.json`) y `state` (`.ag_state/oscillation_history.json`), deteniendo ciclos ping-pong `k >= 1` con `OSCILLATION_CYCLE_DETECTED` (exit `2`).
+  - Nuevo subcomando `guard check-scope --base <ref> --rule-paths <rutas> [--repo <dir>] --json` que evalúa `git diff --name-only <base>...HEAD` e impide mezclar reglas/especificaciones con código productivo (`MIXED_SCOPE_VIOLATION`, exit `2`).
+- **Ergonomía y Sensor AST P3**:
+  - Renegociación agrupada atómica `guard renegotiate --batch <manifiesto.json>` bajo un único testigo constructivo `SCAR-PROC-150` compartido (`batch_id`), con rollback completo (cero recibos escritos) ante cualquier objetivo en verde o testigo inválido (sin `--force`).
+  - Regla AST `MUT001` integrada en `SinglePassVisitor` para detectar mutaciones ocultas en métodos de consulta (`get_*`, `is_*`, `has_*`, `validate_*`: `self.<attr> =`, `AugAssign`, `AnnAssign`, `del`, `global`, `.append/.extend/.pop/.clear/.update` sin descender a ámbitos anidados); advertencia no bloqueante por defecto, bloqueante con `--strict` y supresión explícita auditable `# ag_ops: allow-mutation: <razón>`.
+- **Suite v2.4**: Nueva batería `tests/test_ag_ops_v2_4.py` (18 pruebas cubriendo cero dependencias externas y fases P0–P3).
+
+### Cambiado
+- Construcción de subparsers enfocada por subcomando en `build_parser(only_subcommand=...)`, guarda previa a `stream.reconfigure` si stdout/stderr ya están en UTF-8 y captura de `oscillation_history.json` dentro del mismo `os.scandir` en `state status`, reduciendo la latencia de arranque y estado por debajo de v2.3 en todas las métricas medidas.
+
+### Corregido
+- **Normalización de carpetas con punto inicial (`.gemini/`, `.ag_state/`)**: Reemplazo de `.lstrip("./")` por `_normalize_repo_relpath()` en `_compute_working_tree_hash` y `_guard_check_scope` para no truncar el punto inicial de rutas como `.gemini/rules/policy.md`.
+
+### Seguridad
+- Elevación de contención en *Manipulación de Pruebas* de `5/6` (`83.3 %`) en v2.3 a `12/12` (`100.0 %`) en el benchmark adversarial extendido (contención global `31/36` = `86.11 %`), documentando las fronteras remanentes en `THREAT_MODEL.md`.
+
 ## [2.3.0] - 2026-11-02
 
 ### Añadido
